@@ -38,52 +38,52 @@ class TxAddrMappingUpdater(object):
         _logger.debug('Start TxAddrMappingUpdater')  # type: TxAddrMapping
 
         while True:
-
             # get max id ( either LIMIT or maximum in DB )
-            with session_maker() as s:
-                max_in = min(self.id_counter_inputs + LIMIT,
-                             s.execute(
-                                 text(f"""SELECT id FROM transactions_inputs ORDER by id DESC LIMIT 1"""))
-                             .scalar() or 0)
+            if self.id_counter_inputs is not None and self.id_counter_outputs is not None:
+                with session_maker() as s:
+                    max_in = min(self.id_counter_inputs + LIMIT,
+                                s.execute(
+                                    text(f"""SELECT id FROM transactions_inputs ORDER by id DESC LIMIT 1"""))
+                                .scalar() or 0)
 
-                max_out = min(self.id_counter_outputs + LIMIT,
-                              s.execute(
-                                  text(f"""SELECT id FROM transactions_outputs ORDER by id DESC LIMIT 1"""))
-                              .scalar() or 0)
+                    max_out = min(self.id_counter_outputs + LIMIT,
+                                s.execute(
+                                    text(f"""SELECT id FROM transactions_outputs ORDER by id DESC LIMIT 1"""))
+                                .scalar() or 0)
 
-            try:
-                count_outputs, new_last_block_time_outputs = self.update_outputs(self.id_counter_outputs,
-                                                                                 max_out)
-                count_inputs, new_last_block_time_inputs = self.update_inputs(self.id_counter_inputs,
-                                                                              max_in)
-                # save last runs ids in case of restart
-                KeyValueStore.set("last_id_counter_inputs", max_in)
-                KeyValueStore.set("last_id_counter_outputs", max_out)
+                try:
+                    count_outputs, new_last_block_time_outputs = self.update_outputs(self.id_counter_outputs,
+                                                                                    max_out)
+                    count_inputs, new_last_block_time_inputs = self.update_inputs(self.id_counter_inputs,
+                                                                                max_in)
+                    # save last runs ids in case of restart
+                    KeyValueStore.set("last_id_counter_inputs", max_in)
+                    KeyValueStore.set("last_id_counter_outputs", max_out)
 
-            except Exception:
-                error_cnt += 1
-                if error_cnt <= 3:
+                except Exception:
+                    error_cnt += 1
+                    if error_cnt <= 3:
+                        time.sleep(10)
+                        continue
+                    raise
+                if count_inputs > 0:
+                    _logger.info(f"Updated {count_inputs} input mappings.")
+                if count_outputs > 0:
+                    _logger.info(f"Updated {count_outputs} outputs mappings.")
+
+                last_id_counter_inputs = self.id_counter_inputs
+                last_id_counter_outputs = self.id_counter_outputs
+
+                # next start id is the maximum of last request
+                self.id_counter_inputs = max_in
+                self.id_counter_outputs = max_out
+
+                # _logger.debug(f"Next TX-Input ID: {self.id_counter_inputs}.")
+                # _logger.debug(f"Next TX-Output ID: {self.id_counter_outputs}.")
+
+                if last_id_counter_inputs + LIMIT > self.id_counter_inputs and \
+                        last_id_counter_outputs + LIMIT > self.id_counter_outputs:
                     time.sleep(10)
-                    continue
-                raise
-            if count_inputs > 0:
-                _logger.info(f"Updated {count_inputs} input mappings.")
-            if count_outputs > 0:
-                _logger.info(f"Updated {count_outputs} outputs mappings.")
-
-            last_id_counter_inputs = self.id_counter_inputs
-            last_id_counter_outputs = self.id_counter_outputs
-
-            # next start id is the maximum of last request
-            self.id_counter_inputs = max_in
-            self.id_counter_outputs = max_out
-
-            # _logger.debug(f"Next TX-Input ID: {self.id_counter_inputs}.")
-            # _logger.debug(f"Next TX-Output ID: {self.id_counter_outputs}.")
-
-            if last_id_counter_inputs + LIMIT > self.id_counter_inputs and \
-                    last_id_counter_outputs + LIMIT > self.id_counter_outputs:
-                time.sleep(10)
 
     def get_last_block_time(self, start_block_time):
         with session_maker() as s:

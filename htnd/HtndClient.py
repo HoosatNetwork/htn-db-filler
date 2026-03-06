@@ -1,5 +1,6 @@
 # encoding: utf-8
 import asyncio
+import time
 
 from htnd.HtndThread import HtndThread, HtndCommunicationError
 import logging
@@ -29,19 +30,15 @@ class HtndClient(object):
         except Exception as exc:
             return False
 
-    async def request(self, command, params=None, timeout=60, retry=0):
-        for i in range(1 + retry):
-            try:
-                with HtndThread(self.htnd_host, self.htnd_port) as t:
-                    resp = await t.request(command, params, wait_for_response=True, timeout=timeout)
-                    return resp
-            except HtndCommunicationError:
-                if i == retry:
-                    raise
-                else:
-                    await asyncio.sleep(0.3)
-            except Exception:
-                raise
+    async def request(self, command, params=None, timeout=10):
+        try:
+            with HtndThread(self.htnd_host, self.htnd_port) as t:
+                resp = await t.request(command, params, wait_for_response=True, timeout=timeout)
+                return resp
+        except HtndCommunicationError:
+            raise
+        except Exception:
+            raise
 
     async def notify(self, command, params, callback):
         t = HtndThread(self.htnd_host, self.htnd_port, async_thread=True)

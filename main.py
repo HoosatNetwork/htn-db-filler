@@ -4,6 +4,7 @@ import os
 import threading
 import sys
 import time
+import cProfile
 
 from BlocksProcessor import BlocksProcessor
 from TxAddrMappingUpdater import TxAddrMappingUpdater
@@ -45,23 +46,25 @@ if not htnd_hosts:
 # create Htnd client
 client = HtndMultiClient(htnd_hosts)
 
+
 async def main():
     # initialize htnds
     await client.initialize_all()
 
     while client.htnds[0].is_synced == False:
         _logger.debug('Client not synced yet. Waiting...')
-        time.sleep(60)
+        await asyncio.sleep(60)
 
     # find last acceptedTx's block hash, when restarting this tool
     start_hash = KeyValueStore.get("vspc_last_start_hash")
+    start_block = None
 
     # if there is nothing in the db, just get the first block after genesis.
     daginfo = await client.request("getBlockDagInfoRequest", {})
     if daginfo is None:
         _logger.debug("Failed first BlockDagInfoRequest")
-    virtualParentHash = daginfo["getBlockDagInfoResponse"]["virtualParentHashes"][0]
     if not start_hash:
+        virtualParentHash = daginfo["getBlockDagInfoResponse"]["virtualParentHashes"][0]
         start_hash = virtualParentHash
 
     # if there is argument start_hash start with that instead of last acceptedTx or latest block.
@@ -69,18 +72,85 @@ async def main():
     if env_start_hash != None:
         start_hash = env_start_hash
 
+    find_start_block_str = os.getenv('FIND_START_BLOCK', 'False')  # Default to 'False' if not set
+    find_start_block = find_start_block_str.lower() in ['true', '1', 't', 'y', 'yes']
+
+    _logger.info(f"Find start block: {find_start_block}")
     _logger.info(f"Start hash: {start_hash}")
+    if start_hash:
+        resp = await client.request("getBlockRequest",
+                                             params={
+                                                 "hash": start_hash,
+                                                 "includeTransactions": True,
+                                             },
+                                             timeout=60)
+        if resp is not None and "getBlockResponse" in resp:
+            start_block = resp["getBlockResponse"].get("block", [])
+
+    if find_start_block:
+        _logger.info("Finding start block...")
+        low_hash = start_hash
+        found = False
+        headers_processed = 0
+        used_low_hashes = []
+        while found == False:
+            resp = await client.request("getBlocksRequest",
+                                             params={
+                                                 "lowHash": low_hash,
+                                                 "includeBlocks": True,
+                                                 "includeTransactions": False
+                                             },
+                                             timeout=60)
+            # go through each block and yield
+            if resp is not None:
+                block_hashes = resp["getBlocksResponse"].get("blockHashes", [])
+                blocks = resp["getBlocksResponse"].get("blocks", [])
+                _logger.info(f"Current low hash: {low_hash}, found {len(blocks)} blocks.")
+                for i in range(len(blocks)):
+                    block = blocks[i]
+                    block_hash = block_hashes[i]
+                    isHeaderOnly = block["verboseData"].get('isHeaderOnly')
+                    _logger.info(f"Block hash: {block_hash}, isHeaderOnly: {isHeaderOnly}")
+                    if isHeaderOnly != True:
+                        found = True
+                        start_block = block
+                        start_hash = block_hash
+                        _logger.info(f"Found start block: {start_hash}")
+                headers_processed += len(blocks)
+                _logger.info(f'Processed {headers_processed} headers so far.')
+                used_low_hashes.append(low_hash)
+                for i, block in reversed(list(enumerate(blocks))):
+                    _logger.info(f"Checking next possible low hash {block['verboseData']['hash']}")
+                    if block['verboseData']['hash'] != low_hash:
+                        hash_used = False
+                        for used_low_hash in used_low_hashes:
+                            if used_low_hash == block['verboseData']['hash']:
+                                hash_used = True
+                        if hash_used == False:
+                            low_hash = block['verboseData']['hash']
+                            break
+        used_low_hashes = []
 
     batch_processing_str = os.getenv('BATCH_PROCESSING', 'False')  # Default to 'False' if not set
     batch_processing = batch_processing_str.lower() in ['true', '1', 't', 'y', 'yes']
 
-    env_enable_balance = os.getenv('BALANCE_ENABLED', False)
-    env_update_balance_on_boot = os.getenv('UPDATE_BALANCE_ON_BOOT', False)
+    env_enable_balance_str = os.getenv('BALANCE_ENABLED', 'False')
+    env_enable_balance = env_enable_balance_str.lower() in ['true', '1', 't', 'y', 'yes']
+    env_update_balance_on_boot_str = os.getenv('UPDATE_BALANCE_ON_BOOT', 'False')
+    env_update_balance_on_boot = env_update_balance_on_boot_str.lower() in ['true', '1', 't', 'y', 'yes']
     bap = BalanceProcessor(client)
     if env_update_balance_on_boot is not False: 
         await bap.update_all_balances()
+    env_update_balance_only_str = os.getenv('UPDATE_BALANCE_ONLY', 'False')
+    env_update_balance_only = env_update_balance_only_str.lower() in ['true', '1', 't', 'y', 'yes']
+    if env_update_balance_only is not False:
+        while True:
+            await bap.update_all_balances()
+            # Use non-blocking sleep inside async context
+            await asyncio.sleep(1800)
+
     # create instances of blocksprocessor and virtualchainprocessor
-    vcp = VirtualChainProcessor(client, start_hash)
+    vcp = VirtualChainProcessor(client, start_block, start_hash)
     bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
 
     # start blocks processor working concurrent
@@ -93,6 +163,7 @@ async def main():
 
 
 if __name__ == '__main__':
+    cProfile.run("main()", "profile_output.prof")
     tx_addr_mapping_updater = TxAddrMappingUpdater()
 
 

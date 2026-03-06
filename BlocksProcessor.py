@@ -3,8 +3,10 @@ import asyncio
 import logging
 import sys
 from datetime import datetime
+import time
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import SQLAlchemyError
 
 from dbsession import session_maker
 from models.Block import Block
@@ -13,8 +15,14 @@ from utils.Event import Event
 
 _logger = logging.getLogger(__name__)
 
+# For 5 BPS
+# CLUSTER_SIZE = 4
+# CLUSTER_WAIT_SECONDS = 1
+
+# For 1 BPS
 CLUSTER_SIZE = 5
-CLUSTER_WAIT_SECONDS = 4
+CLUSTER_WAIT_SECONDS = 15
+
 B_TREE_SIZE = 2500
 
 task_runner = None
@@ -36,6 +44,7 @@ class BlocksProcessor(object):
         self.vcp = vcp_instance
         self.env_enable_balance = env_enable_balance
         self.batch_processing = batch_processing
+        self.start_hash_set = False
 
         # Did the loop already see the DAG tip
         self.synced = False
@@ -47,10 +56,13 @@ class BlocksProcessor(object):
             # prepare add block and tx to database
             await self.__add_block_to_queue(block_hash, block)
             await self.__add_tx_to_queue(block_hash, block)
+            if block["verboseData"].get("isHeaderOnly") != True and self.start_hash_set == False: 
+                await self.vcp.set_start_block(block, block_hash)
+                self.start_hash_set = True
             # if cluster size is reached, insert to database
             cluster_size = CLUSTER_SIZE
             if not self.synced:
-                cluster_size *= 50 
+                cluster_size = 403
             if len(self.blocks_to_add) >= cluster_size:
                 _logger.debug(f'Committing {cluster_size} blocks at {block_hash}')
                 await self.commit_blocks()
@@ -59,15 +71,30 @@ class BlocksProcessor(object):
                 else: 
                     await self.batch_commit_txs()
                 asyncio.create_task(self.handle_blocks_committed())
-                if self.env_enable_balance != False and self.synced:
-                    asyncio.create_task(self.commit_balances(self.addresses_to_update))
+                # Update balances whenever a cluster is committed, not only at tip
+                if self.env_enable_balance != False:
+                    # Enqueue for background balance worker; do not block block processing
+                    self.commit_balances(self.addresses_to_update)
                     
 
-    async def commit_balances(self, addresses):
-        unique_addresses = list(set(addresses))
-        for address in unique_addresses:    
-            await self.balance.update_balance_from_rpc(address)
-            await asyncio.sleep(0.1)
+    def commit_balances(self, addresses):
+        try:
+            unique_addresses = list(set(addresses or []))
+            if not unique_addresses:
+                return
+
+            # Prefer threaded/batched background processing when available
+            if hasattr(self.balance, "enqueue_balance_updates"):
+                _logger.info(f"Enqueueing {len(unique_addresses)} addresses for balance update")
+                self.balance.enqueue_balance_updates(unique_addresses)
+            else:
+                # Best-effort fallback: run async updater in background
+                asyncio.create_task(self.balance.update_balance_from_rpc(unique_addresses))
+
+            # After enqueuing balances for the cluster, clear for next round
+            self.addresses_to_update = []
+        except Exception as e:
+            _logger.error(f'Error enqueueing balances for addresses {len(unique_addresses) if "unique_addresses" in locals() else "?"}: {e}')
         
 
     async def handle_blocks_committed(self):
@@ -85,39 +112,50 @@ class BlocksProcessor(object):
         """
         low_hash = start_point
         while True:
-            _logger.info('New low hash block %s.', low_hash)
+            _logger.info('Requesting with low hash block %s.', low_hash)
             daginfo = await self.client.request("getBlockDagInfoRequest", {})
-            resp = await self.client.request("getBlocksRequest",
-                                             params={
-                                                 "lowHash": low_hash,
-                                                 "includeTransactions": True,
-                                                 "includeBlocks": True
-                                             },
-                                             timeout=60)
-            # go through each block and yield
-            block_hashes = resp["getBlocksResponse"].get("blockHashes", [])
-            _logger.info(f'Received {len(block_hashes)} blocks from getBlocksResponse')
-            blocks = resp["getBlocksResponse"].get("blocks", [])
-            for i, blockHash in enumerate(block_hashes):
-                if daginfo["getBlockDagInfoResponse"]["tipHashes"][0] == blockHash:
-                    _logger.info('Found tip hash. Generator is synced now.')
-                    self.synced = True
-                    break # Dont iterate over the tipHash, because getBlock request returns old blocks. 
-                # yield blockhash and it's data
-                yield blockHash, blocks[i]
-            if self.synced: 
-                low_hash = daginfo["getBlockDagInfoResponse"]["tipHashes"][0]
-            else:
-                if len(block_hashes) > 1:
-                    low_hash = block_hashes[len(block_hashes) - 1]
-            _logger.info(f'Waiting for the next blocks request.')
-            await asyncio.sleep(CLUSTER_WAIT_SECONDS)
+            if daginfo != None:
+                resp = await self.client.request("getBlocksRequest",
+                                                params={
+                                                    "lowHash": low_hash,
+                                                    "includeTransactions": True,
+                                                    "includeBlocks": True
+                                                },
+                                                timeout=30)
+                # go through each block and yield
+                if resp != None:
+                    block_response = resp.get("getBlocksResponse", None)
+                    if block_response != None:
+                        block_hashes = block_response.get("blockHashes", [])
+                        _logger.info(f'Received {len(block_hashes)} blocks from getBlocksResponse')
+                        blocks = block_response.get("blocks", [])
+                        for i, blockHash in enumerate(block_hashes):
+                            if daginfo["getBlockDagInfoResponse"]["tipHashes"][0] == blockHash:
+                                _logger.info('Found tip hash. Generator is synced now.')
+                                self.synced = True
+                                break # Dont iterate over the tipHash, because getBlock request returns old blocks. 
+                            # yield blockhash and it's data
+                            yield blockHash, blocks[i]
+                        if self.synced: 
+                            low_hash = daginfo["getBlockDagInfoResponse"]["tipHashes"][0]
+                            self.synced = False
+                            _logger.info(f'Waiting for the next blocks request.')
+                            await asyncio.sleep(CLUSTER_WAIT_SECONDS)
+                            _logger.info('New low hash block %s.', low_hash)
+                        else:
+                            if len(block_hashes) > 1:
+                                low_hash = block_hashes[len(block_hashes) - 1]
+                            _logger.info('New low hash block %s.', low_hash)
+                else:
+                    await asyncio.sleep(CLUSTER_WAIT_SECONDS * 2)
+                    raise RuntimeError("Forced crash: No valid response from getBlocksRequest")
+            await asyncio.sleep(1)
 
     async def __add_tx_to_queue(self, block_hash, block):
         """
         Adds block's transactions to queue. This is only prepartion without commit!
         """
-        self.addresses_to_update = []
+        # Accumulate addresses across the whole cluster; do not reset here.
         if block.get("transactions") is not None:
             for transaction in block["transactions"]:
                 if transaction.get("verboseData") is not None:
@@ -126,7 +164,16 @@ class BlocksProcessor(object):
                     # Check, that the transaction isn't prepared yet. Otherwise ignore
                     if not self.is_tx_id_in_queue(tx_id):
                         # Add transaction
-                        self.txs[tx_id] = Transaction(subnetwork_id=transaction["subnetworkId"],
+                        if transaction["subnetworkId"] == "0300000000000000000000000000000000000000":
+                            self.txs[tx_id] = Transaction(subnetwork_id=transaction["subnetworkId"],
+                                                    transaction_id=tx_id,
+                                                    hash=transaction["verboseData"]["hash"],
+                                                    mass=transaction["verboseData"].get("mass"),
+                                                    block_hash=[transaction["verboseData"]["blockHash"]],
+                                                    block_time=int(transaction["verboseData"]["blockTime"]),
+                                                    payload=transaction.get("payload"))
+                        else:
+                            self.txs[tx_id] = Transaction(subnetwork_id=transaction["subnetworkId"],
                                                     transaction_id=tx_id,
                                                     hash=transaction["verboseData"]["hash"],
                                                     mass=transaction["verboseData"].get("mass"),
@@ -295,7 +342,6 @@ class BlocksProcessor(object):
             parent_hashes = block["header"]["parents"][0].get("parentHashes", [])
         else:
             parent_hashes = []
-
         block_entity = Block(hash=block_hash,
                              accepted_id_merkle_root=block["header"]["acceptedIdMerkleRoot"],
                              difficulty=block["verboseData"]["difficulty"],
@@ -308,7 +354,7 @@ class BlocksProcessor(object):
                              blue_work=block["header"]["blueWork"],
                              daa_score=int(block["header"].get("daaScore", 0)),
                              hash_merkle_root=block["header"]["hashMerkleRoot"],
-                             nonce=block["header"]["nonce"],
+                             nonce=block["header"].get("nonce", 0),
                              parents=parent_hashes,
                              pruning_point=block["header"]["pruningPoint"],
                              timestamp=datetime.fromtimestamp(int(block["header"]["timestamp"]) / 1000).isoformat(),
@@ -321,28 +367,44 @@ class BlocksProcessor(object):
 
     async def commit_blocks(self):
         """
-        Insert queued blocks to database
+        Insert queued blocks to database only if they don't already exist
         """
-        # delete already set old blocks
         with session_maker() as session:
-            d = session.query(Block).filter(
-                Block.hash.in_([b.hash for b in self.blocks_to_add])).delete()
-            session.commit()
-
-        # insert blocks
-        with session_maker() as session:
-            for block in self.blocks_to_add:
-                session.add(block)
             try:
-                session.commit()
-                _logger.debug(f'Added {len(self.blocks_to_add)} blocks to database. '
-                              f'Timestamp: {self.blocks_to_add[-1].timestamp}')
-
-                # reset queue
+                blocks_to_insert = []
+                block_hashes = [b.hash for b in self.blocks_to_add]
+                _logger.debug(f'Checking blocks with hashes: {block_hashes}')
+                
+                # Check which blocks already exist
+                existing_hashes = set(
+                    session.query(Block.hash)
+                    .filter(Block.hash.in_(block_hashes))
+                    .all()
+                )
+                existing_hashes = {h[0] for h in existing_hashes}
+                
+                # Only add blocks that don't exist
+                for block in self.blocks_to_add:
+                    if block.hash not in existing_hashes:
+                        blocks_to_insert.append(block)
+                
+                if blocks_to_insert:
+                    for block in blocks_to_insert:
+                        session.add(block)
+                    session.commit()
+                    _logger.debug(f'Added {len(blocks_to_insert)} new blocks to database. '
+                                f'Timestamp: {blocks_to_insert[-1].timestamp}')
+                else:
+                    _logger.debug('No new blocks to add to database.')
+                
                 self.blocks_to_add = []
-            except IntegrityError:
+            except IntegrityError as e:
                 session.rollback()
-                _logger.error('Error adding group of blocks')
+                _logger.error(f'Error adding group of blocks: {e}')
+                raise
+            except Exception as e:
+                session.rollback()
+                _logger.error(f'Unexpected error committing blocks: {e}')
                 raise
         
 

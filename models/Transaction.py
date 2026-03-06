@@ -14,6 +14,7 @@ class Transaction(Base):
     block_time = Column(BigInteger)  # "1663286480803"
     is_accepted = Column(Boolean, default=False)
     accepting_block_hash = Column(String, nullable=True)
+    payload = Column(String, nullable=True)
 
 
 Index("block_time_idx", Transaction.block_time)
