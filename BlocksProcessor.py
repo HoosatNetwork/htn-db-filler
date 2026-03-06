@@ -133,7 +133,7 @@ class BlocksProcessor(object):
                                                     block_hash=[transaction["verboseData"]["blockHash"]],
                                                     block_time=int(transaction["verboseData"]["blockTime"]))
                         for index, out in enumerate(transaction.get("outputs", [])):
-                            address = out["verboseData"]["scriptPublicKeyAddress"]
+                            address = out["verboseData"].get("scriptPublicKeyAddress")
                             amount = out["amount"]
                             if self.env_enable_balance != False: 
                                 if address not in self.addresses_to_update:
@@ -143,7 +143,7 @@ class BlocksProcessor(object):
                                                                     amount=amount,
                                                                     script_public_key=out["scriptPublicKey"]["scriptPublicKey"],
                                                                     script_public_key_address=address,
-                                                                    script_public_key_type=out["verboseData"]["scriptPublicKeyType"]))
+                                                                    script_public_key_type=out["verboseData"].get("scriptPublicKeyType")))
 
                         for index, tx_in in enumerate(transaction.get("inputs", [])):
                             if self.env_enable_balance != False: 
