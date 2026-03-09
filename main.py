@@ -159,7 +159,10 @@ async def main():
             await bp.loop(start_hash)
         except Exception:
             _logger.exception('Exception occured and script crashed..')
-            raise
+            break  # Exit the loop cleanly if an unexpected error occurs
+        else:
+            _logger.error('BlocksProcessor.loop exited unexpectedly. Exiting main loop.')
+            break
 
 
 if __name__ == '__main__':
