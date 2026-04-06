@@ -31,10 +31,17 @@ class BalanceProcessor(object):
         self._commit_every = int(os.getenv("BALANCE_COMMIT_EVERY", "1"))
         self._deadlock_retries = int(os.getenv("BALANCE_DEADLOCK_RETRIES", "5"))
         self._deadlock_backoff_seconds = float(os.getenv("BALANCE_DEADLOCK_BACKOFF_SECONDS", "0.2"))
+        self._rpc_timeout_seconds = float(os.getenv("BALANCE_RPC_TIMEOUT_SECONDS", "180"))
+        self._retry_base_delay_seconds = float(os.getenv("BALANCE_RETRY_BASE_DELAY_SECONDS", "1"))
+        self._retry_max_delay_seconds = float(os.getenv("BALANCE_RETRY_MAX_DELAY_SECONDS", "60"))
+        self._retry_max_attempts = int(os.getenv("BALANCE_RETRY_MAX_ATTEMPTS", "5"))
         self._threaded = os.getenv("BALANCE_THREADED", "True").lower() in ["true", "1", "t", "y", "yes"]
 
         self._pending_lock = threading.Lock()
         self._pending_addrs: set[str] = set()
+        self._retry_counts: dict[str, int] = {}
+        self._retry_timers: dict[str, threading.Timer] = {}
+        self._logged_raw_failure_payloads: set[str] = set()
         self._has_work = threading.Event()
         self._stop = threading.Event()
         self._worker_thread: threading.Thread | None = None
@@ -52,7 +59,9 @@ class BalanceProcessor(object):
 
         _logger.info(
             f"BalanceProcessor: threaded={self._threaded}, pause={self._pause_seconds}s, "
-            f"batch_size={self._batch_size}, commit_every={self._commit_every}"
+            f"batch_size={self._batch_size}, commit_every={self._commit_every}, "
+            f"rpc_timeout={self._rpc_timeout_seconds}s, retry_max_attempts={self._retry_max_attempts}, "
+            f"retry_base_delay={self._retry_base_delay_seconds}s, retry_max_delay={self._retry_max_delay_seconds}s"
         )
 
     @staticmethod
@@ -81,11 +90,19 @@ class BalanceProcessor(object):
     def stop_worker(self, join_timeout: float | None = 2.0) -> None:
         self._stop.set()
         self._has_work.set()
+        with self._pending_lock:
+            for timer in self._retry_timers.values():
+                timer.cancel()
+            self._retry_timers.clear()
         if self._worker_thread and join_timeout is not None:
             self._worker_thread.join(timeout=join_timeout)
 
     def enqueue_balance_updates(self, addresses: List[str] | None) -> None:
         """Queue addresses for balance refresh without blocking the event loop."""
+        self._enqueue_addresses(addresses, reset_retries=True)
+
+    def _enqueue_addresses(self, addresses: List[str] | None, reset_retries: bool) -> None:
+        """Queue addresses for processing, optionally clearing retry state."""
         if not addresses:
             return
         if not isinstance(addresses, list):
@@ -95,17 +112,21 @@ class BalanceProcessor(object):
         ignored_duplicates = 0
         invalid = 0
         with self._pending_lock:
-            before = len(self._pending_addrs)
             for addr in addresses:
                 if not isinstance(addr, str) or not addr:
                     invalid += 1
                     continue
+                retry_timer = self._retry_timers.pop(addr, None)
+                if retry_timer is not None:
+                    retry_timer.cancel()
+                if reset_retries:
+                    self._retry_counts.pop(addr, None)
+                    self._logged_raw_failure_payloads.discard(addr)
                 if addr in self._pending_addrs:
                     ignored_duplicates += 1
                     continue
                 self._pending_addrs.add(addr)
                 added += 1
-            after = len(self._pending_addrs)
         self._has_work.set()
 
         # Ensure worker is running (in case loop was attached after init)
@@ -121,6 +142,64 @@ class BalanceProcessor(object):
                 f"BalanceProcessor: queued balances (pending={pending}, added={added}, dup={ignored_duplicates}, invalid={invalid})"
             )
             self._last_enqueue_log_ts = now
+
+    def _clear_retry_state(self, address: str) -> None:
+        with self._pending_lock:
+            self._retry_counts.pop(address, None)
+            self._logged_raw_failure_payloads.discard(address)
+            retry_timer = self._retry_timers.pop(address, None)
+        if retry_timer is not None:
+            retry_timer.cancel()
+
+    def _log_raw_payload_once(self, address: str, response) -> None:
+        with self._pending_lock:
+            if address in self._logged_raw_failure_payloads:
+                return
+            self._logged_raw_failure_payloads.add(address)
+
+        _logger.error(
+            f"BalanceProcessor: first invalid getBalanceByAddress response for {address}: {response}"
+        )
+
+    def _enqueue_retry_address(self, address: str) -> None:
+        if self._stop.is_set():
+            return
+        with self._pending_lock:
+            self._retry_timers.pop(address, None)
+        self._enqueue_addresses([address], reset_retries=False)
+
+    def _schedule_failed_retries(self, addresses: list[str]) -> None:
+        for address in sorted(set(addresses)):
+            with self._pending_lock:
+                attempts = self._retry_counts.get(address, 0) + 1
+                if attempts > self._retry_max_attempts:
+                    self._retry_counts.pop(address, None)
+                    self._logged_raw_failure_payloads.discard(address)
+                    existing_timer = self._retry_timers.pop(address, None)
+                    if existing_timer is not None:
+                        existing_timer.cancel()
+                    _logger.error(
+                        f"BalanceProcessor: dropping address {address} after {self._retry_max_attempts} failed retries"
+                    )
+                    continue
+
+                self._retry_counts[address] = attempts
+                delay = min(
+                    self._retry_base_delay_seconds * (2 ** (attempts - 1)),
+                    self._retry_max_delay_seconds,
+                )
+                existing_timer = self._retry_timers.pop(address, None)
+                if existing_timer is not None:
+                    existing_timer.cancel()
+
+                retry_timer = threading.Timer(delay, self._enqueue_retry_address, args=(address,))
+                retry_timer.daemon = True
+                self._retry_timers[address] = retry_timer
+
+            _logger.warning(
+                f"BalanceProcessor: scheduling retry {attempts}/{self._retry_max_attempts} for {address} in {delay:.2f}s"
+            )
+            retry_timer.start()
 
     def _drain_pending_batch(self, max_items: int) -> list[str]:
         batch: list[str] = []
@@ -157,6 +236,7 @@ class BalanceProcessor(object):
                 _logger.info(f"BalanceProcessor: processing batch size={len(batch)}")
 
                 failed_addresses: list[str] = []
+                successful_addresses: list[str] = []
                 with session_maker() as session:
                     since_commit = 0
                     for address in batch:
@@ -164,7 +244,7 @@ class BalanceProcessor(object):
                             break
                         try:
                             fut = asyncio.run_coroutine_threadsafe(self._get_balance_from_rpc(address), loop)
-                            new_balance = fut.result(timeout=75)
+                            new_balance = fut.result(timeout=self._rpc_timeout_seconds + 15)
 
                             # Avoid query-triggered autoflush mid-loop.
                             with session.no_autoflush:
@@ -202,6 +282,9 @@ class BalanceProcessor(object):
                                         raise
                                 if not committed:
                                     failed_addresses.append(address)
+                                    continue
+
+                            successful_addresses.append(address)
 
                         except concurrent.futures.TimeoutError:
                             _logger.error(f"Balance RPC timed out for address {address}")
@@ -238,8 +321,11 @@ class BalanceProcessor(object):
                         _logger.error(f"Balance worker DB commit error: {e}")
                         failed_addresses = list(set(failed_addresses + batch))
 
+                for address in set(successful_addresses) - set(failed_addresses):
+                    self._clear_retry_state(address)
+
                 if failed_addresses:
-                    self.enqueue_balance_updates(failed_addresses)
+                    self._schedule_failed_retries(failed_addresses)
 
                 with self._pending_lock:
                     pending = len(self._pending_addrs)
@@ -253,7 +339,14 @@ class BalanceProcessor(object):
         Fetch balance for the given address from the RPC node.
         """
         try:
-            response = await self.client.request("getBalanceByAddressRequest", params= {"address": address}, timeout=60)
+            response = await self.client.request(
+                "getBalanceByAddressRequest",
+                params={"address": address},
+                timeout=self._rpc_timeout_seconds,
+            )
+
+            if response is None:
+                raise RuntimeError(f"RPC returned no response for address {address}")
 
             get_balance_response = response.get("getBalanceByAddressResponse", {})
             balance = get_balance_response.get("balance", None)
@@ -261,9 +354,16 @@ class BalanceProcessor(object):
 
             if error:
                 _logger.error(f"Error fetching balance for address {address}: {error}")
+                self._log_raw_payload_once(address, response)
+                return None
             
             if balance is not None:
                 return int(balance)
+
+            self._log_raw_payload_once(address, response)
+            raise RuntimeError(
+                f"RPC response missing balance for address {address}: {get_balance_response}"
+            )
             
             return None
         

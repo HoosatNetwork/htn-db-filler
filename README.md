@@ -31,6 +31,20 @@ The following environment variables can be set to customize the behavior of the 
    UPDATE_BALANCE_ON_BOOT=true
    ```
 
+5. **Increase Balance RPC Timeout:**
+   If balance lookups need more time, override the default timeout of 180 seconds:
+   ```
+   BALANCE_RPC_TIMEOUT_SECONDS=180
+   ```
+
+6. **Control Balance Retry Backoff:**
+   Failed balance lookups use exponential backoff and stop after a maximum retry count:
+   ```
+   BALANCE_RETRY_BASE_DELAY_SECONDS=1
+   BALANCE_RETRY_MAX_DELAY_SECONDS=60
+   BALANCE_RETRY_MAX_ATTEMPTS=5
+   ```
+
 ## Modifications & Improvements
 
 The following key modifications have been made to improve the functionality and efficiency of the database filler:
