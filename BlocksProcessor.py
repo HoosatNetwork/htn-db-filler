@@ -114,7 +114,7 @@ class BlocksProcessor(object):
         while True:
             _logger.info('Requesting with low hash block %s.', low_hash)
             daginfo = await self.client.request("getBlockDagInfoRequest", {})
-            if daginfo != None:
+            if daginfo is not None:
                 resp = await self.client.request("getBlocksRequest",
                                                 params={
                                                     "lowHash": low_hash,
@@ -123,9 +123,9 @@ class BlocksProcessor(object):
                                                 },
                                                 timeout=30)
                 # go through each block and yield
-                if resp != None:
+                if resp is not None:
                     block_response = resp.get("getBlocksResponse", None)
-                    if block_response != None:
+                    if block_response is not None:
                         block_hashes = block_response.get("blockHashes", [])
                         _logger.info(f'Received {len(block_hashes)} blocks from getBlocksResponse')
                         blocks = block_response.get("blocks", [])
@@ -147,8 +147,9 @@ class BlocksProcessor(object):
                                 low_hash = block_hashes[len(block_hashes) - 1]
                             _logger.info('New low hash block %s.', low_hash)
                 else:
+                    _logger.error("No valid response from getBlocksRequest. Skipping this iteration and waiting before retry.")
                     await asyncio.sleep(CLUSTER_WAIT_SECONDS * 2)
-                    raise RuntimeError("Forced crash: No valid response from getBlocksRequest")
+                    break  # Exit the generator gracefully instead of crashing
             await asyncio.sleep(1)
 
     async def __add_tx_to_queue(self, block_hash, block):

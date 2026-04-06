@@ -338,38 +338,36 @@ class BalanceProcessor(object):
         """
         Fetch balance for the given address from the RPC node.
         """
-        try:
-            response = await self.client.request(
-                "getBalanceByAddressRequest",
-                params={"address": address},
-                timeout=self._rpc_timeout_seconds,
+        response = await self.client.request(
+            "getBalanceByAddressRequest",
+            params={"address": address},
+            timeout=60,
+        )
+
+        # HtndThread returns None on DEADLINE_EXCEEDED. Treat as a fetch failure
+        # (do not delete existing DB rows for transient RPC issues).
+        if response is None:
+            raise TimeoutError(f"RPC getBalanceByAddressRequest timed out for address {address}")
+
+        if not isinstance(response, dict):
+            raise TypeError(f"Unexpected RPC response type for address {address}: {type(response)}")
+
+        get_balance_response = response.get("getBalanceByAddressResponse")
+        if not isinstance(get_balance_response, dict):
+            raise ValueError(
+                f"Missing/invalid getBalanceByAddressResponse for address {address}: {response}"
             )
 
-            if response is None:
-                raise RuntimeError(f"RPC returned no response for address {address}")
+        error = get_balance_response.get("error")
+        if error:
+            # Keep this as an exception so callers can retry later.
+            raise RuntimeError(f"RPC error for address {address}: {error}")
 
-            get_balance_response = response.get("getBalanceByAddressResponse", {})
-            balance = get_balance_response.get("balance", None)
-            error = get_balance_response.get("error", None)
+        balance = get_balance_response.get("balance")
+        if balance is None:
+            raise ValueError(f"RPC response missing balance for address {address}: {get_balance_response}")
 
-            if error:
-                _logger.error(f"Error fetching balance for address {address}: {error}")
-                self._log_raw_payload_once(address, response)
-                return None
-            
-            if balance is not None:
-                return int(balance)
-
-            self._log_raw_payload_once(address, response)
-            raise RuntimeError(
-                f"RPC response missing balance for address {address}: {get_balance_response}"
-            )
-            
-            return None
-        
-        except Exception as e:
-            _logger.error(f"Error fetching balance for address {address}: {e}")
-            return None
+        return int(balance)
 
     async def update_all_balances(self):
         with session_maker() as session:
@@ -440,26 +438,30 @@ class BalanceProcessor(object):
                             _logger.debug(f"Fetched balance {new_balance} for address {address}")
                             existing_balance = session.query(Balance).filter_by(script_public_key_address=address).first()
 
+                            # _get_balance_from_rpc should not return None; if it does,
+                            # treat it as a fetch failure rather than deleting DB rows.
                             if new_balance is None:
-                                if existing_balance:
-                                    session.delete(existing_balance)
-                                    _logger.debug(f"Deleted balance record for address {address} (balance is None)")
-                                    deleted_count += 1
-                                else:
-                                    skipped_count += 1
+                                _logger.warning(
+                                    f"Balance fetch returned None for {address}; skipping update and retrying later"
+                                )
+                                failed_addresses.append(address)
+                                skipped_count += 1
+                                continue
+
+                            if existing_balance:
+                                existing_balance.balance = new_balance
+                                _logger.debug(f"Updated balance for address {address} to {new_balance}")
+                                updated_count += 1
                             else:
-                                if existing_balance:
-                                    existing_balance.balance = new_balance
-                                    _logger.debug(f"Updated balance for address {address} to {new_balance}")
-                                    updated_count += 1
-                                else:
-                                    new_record = Balance(
-                                        script_public_key_address=address,
-                                        balance=new_balance
-                                    )
-                                    session.add(new_record)
-                                    _logger.debug(f"Created new balance record for address {address} with balance {new_balance}")
-                                    created_count += 1
+                                new_record = Balance(
+                                    script_public_key_address=address,
+                                    balance=new_balance,
+                                )
+                                session.add(new_record)
+                                _logger.debug(
+                                    f"Created new balance record for address {address} with balance {new_balance}"
+                                )
+                                created_count += 1
                             processed_count += 1
                         except Exception as e:
                             _logger.error(f"Error processing address {address} in batch {i // batch_size + 1}: {e}")
