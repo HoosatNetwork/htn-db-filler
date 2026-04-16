@@ -364,8 +364,9 @@ class BalanceProcessor(object):
             raise RuntimeError(f"RPC error for address {address}: {error}")
 
         balance = get_balance_response.get("balance")
+        # Proto3 JSON commonly omits default values (0), so empty addresses may not include "balance".
         if balance is None:
-            raise ValueError(f"RPC response missing balance for address {address}: {get_balance_response}")
+            return 0
 
         return int(balance)
 

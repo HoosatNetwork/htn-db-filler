@@ -139,14 +139,15 @@ async def main():
     env_update_balance_on_boot_str = os.getenv('UPDATE_BALANCE_ON_BOOT', 'False')
     env_update_balance_on_boot = env_update_balance_on_boot_str.lower() in ['true', '1', 't', 'y', 'yes']
     bap = BalanceProcessor(client)
-    if env_update_balance_on_boot is not False: 
+    if env_update_balance_on_boot:
         await bap.update_all_balances()
+
     env_update_balance_only_str = os.getenv('UPDATE_BALANCE_ONLY', 'False')
     env_update_balance_only = env_update_balance_only_str.lower() in ['true', '1', 't', 'y', 'yes']
-    if env_update_balance_only is not False:
+    if env_update_balance_only:
+        _logger.info('UPDATE_BALANCE_ONLY enabled: running periodic full balance refresh.')
         while True:
             await bap.update_all_balances()
-            # Use non-blocking sleep inside async context
             await asyncio.sleep(1800)
 
     # create instances of blocksprocessor and virtualchainprocessor
@@ -166,16 +167,17 @@ async def main():
 
 
 if __name__ == '__main__':
-    cProfile.run("main()", "profile_output.prof")
-    tx_addr_mapping_updater = TxAddrMappingUpdater()
+    update_balance_only_str = os.getenv('UPDATE_BALANCE_ONLY', 'False')
+    update_balance_only = update_balance_only_str.lower() in ['true', '1', 't', 'y', 'yes']
 
+    tx_addr_mapping_updater = TxAddrMappingUpdater()
 
     # custom exception hook for thread
     def custom_hook(args):
         global tx_addr_mapping_updater
         # report the failure
         _logger.error(f'Thread failed: {args.exc_value}')
-        thread = args[3]
+        thread = args.thread
 
         # check if TxAddrMappingUpdater
         if thread.name == 'TxAddrMappingUpdater':
@@ -187,9 +189,25 @@ if __name__ == '__main__':
     # set the exception hook
     threading.excepthook = custom_hook
 
-    # run TxAddrMappingUpdater
-    # will be rerun
-    _logger.info('Starting updater thread now.')
-    threading.Thread(target=tx_addr_mapping_updater.loop, daemon=True, name="TxAddrMappingUpdater").start()
+    if not update_balance_only:
+        # run TxAddrMappingUpdater
+        # will be rerun
+        _logger.info('Starting updater thread now.')
+        threading.Thread(target=tx_addr_mapping_updater.loop, daemon=True, name="TxAddrMappingUpdater").start()
+    else:
+        _logger.info('UPDATE_BALANCE_ONLY enabled: skipping TxAddrMappingUpdater thread.')
+
     _logger.info('Starting main thread now.')
-    asyncio.run(main())
+
+    profile_str = os.getenv('PROFILE', 'False')
+    profile = profile_str.lower() in ['true', '1', 't', 'y', 'yes']
+    if profile:
+        profiler = cProfile.Profile()
+        profiler.enable()
+        try:
+            asyncio.run(main())
+        finally:
+            profiler.disable()
+            profiler.dump_stats("profile_output.prof")
+    else:
+        asyncio.run(main())
