@@ -371,32 +371,151 @@ class BalanceProcessor(object):
         return int(balance)
 
     async def update_all_balances(self):
+        """Refresh balances for all known addresses.
+
+        In large databases, a `SELECT DISTINCT ... ORDER BY ...` over `transactions_outputs`
+        can take a very long time and appear "stuck" before any log is emitted.
+
+        Strategy:
+        - Prefer reading from `balances` (fast, already unique) when it has rows.
+        - Otherwise, stream addresses from `transactions_outputs` without `DISTINCT` and
+          let the in-process de-dupe (`_pending_addrs` set) handle repeats.
+        """
+        db_fetch_size = int(os.getenv("BALANCE_FULL_REFRESH_DB_FETCH_SIZE", "50000"))
+        enqueue_chunk_size = int(os.getenv("BALANCE_FULL_REFRESH_ENQUEUE_CHUNK", "5000"))
+        log_every_seconds = float(os.getenv("BALANCE_FULL_REFRESH_LOG_EVERY_SECONDS", "10"))
+
         with session_maker() as session:
             try:
                 from sqlalchemy import text
-                query = session.execute(
-                    text("""
-                    SELECT DISTINCT script_public_key_address 
-                    FROM transactions_outputs 
-                    WHERE script_public_key_address IS NOT NULL 
-                    ORDER BY script_public_key_address
-                    """)
+
+                # Allow explicit override for troubleshooting.
+                src = os.getenv("BALANCE_FULL_REFRESH_SOURCE", "").strip().lower()
+                if src not in {"", "auto", "balances", "transactions_outputs"}:
+                    _logger.warning(
+                        f"Unknown BALANCE_FULL_REFRESH_SOURCE={src!r}; using auto selection"
+                    )
+                    src = ""
+
+                if src in {"", "auto"}:
+                    has_balances = session.execute(text("SELECT 1 FROM balances LIMIT 1")).first() is not None
+                    src = "balances" if has_balances else "transactions_outputs"
+
+                if src == "balances":
+                    sql = "SELECT script_public_key_address FROM balances"
+                else:
+                    sql = (
+                        "SELECT script_public_key_address "
+                        "FROM transactions_outputs "
+                        "WHERE script_public_key_address IS NOT NULL AND script_public_key_address <> ''"
+                    )
+
+                _logger.info(
+                    f"Starting full balance refresh (source={src}, threaded={self._threaded}, "
+                    f"db_fetch_size={db_fetch_size}, enqueue_chunk={enqueue_chunk_size})"
                 )
 
-                addresses = [row[0] for row in query.fetchall()]
+                # Important: when the threaded balance worker is enabled, it schedules RPC coroutines
+                # onto the asyncio loop. A long synchronous DB scan here can starve the loop and make
+                # the worker appear "stuck". Run the scan in a background thread so the loop can
+                # continue servicing RPC requests.
+                if self._threaded:
 
-                if not addresses:
-                    _logger.info("No addresses found to update balances.")
+                    def scan_and_enqueue() -> None:
+                        from sqlalchemy import text as _text
+
+                        scanned_rows = 0
+                        queued_total = 0
+                        chunk: list[str] = []
+                        last_log_ts = time.time()
+
+                        with session_maker() as scan_session:
+                            result = scan_session.execute(_text(sql).execution_options(stream_results=True))
+                            while True:
+                                rows = result.fetchmany(db_fetch_size)
+                                if not rows:
+                                    break
+
+                                scanned_rows += len(rows)
+                                for row in rows:
+                                    addr = row[0]
+                                    if isinstance(addr, str) and addr:
+                                        chunk.append(addr)
+
+                                if len(chunk) >= enqueue_chunk_size:
+                                    to_process = list(set(chunk))
+                                    queued_total += len(to_process)
+                                    chunk.clear()
+                                    self.enqueue_balance_updates(to_process)
+
+                                now = time.time()
+                                if now - last_log_ts >= log_every_seconds:
+                                    with self._pending_lock:
+                                        pending = len(self._pending_addrs)
+                                    _logger.info(
+                                        "Full balance refresh progress: "
+                                        f"scanned_rows={scanned_rows}, queued={queued_total}, pending={pending}"
+                                    )
+                                    last_log_ts = now
+
+                        if chunk:
+                            to_process = list(set(chunk))
+                            queued_total += len(to_process)
+                            self.enqueue_balance_updates(to_process)
+
+                        with self._pending_lock:
+                            pending = len(self._pending_addrs)
+                        _logger.info(
+                            "Full balance refresh queued. "
+                            f"scanned_rows={scanned_rows}, queued={queued_total}, pending={pending}"
+                        )
+
+                    await asyncio.to_thread(scan_and_enqueue)
                     return
 
-                _logger.info(f"Found {len(addresses)} addresses to update balances.")
+                # Non-threaded mode: run updates directly (still may take a while on large scans).
+                result = session.execute(text(sql).execution_options(stream_results=True))
 
-                # For bulk updates (e.g. on boot), allow threading to avoid blocking.
-                if self._threaded:
-                    self.enqueue_balance_updates(addresses)
-                else:
-                    await self.update_balance_from_rpc(addresses, 10)
-                    await asyncio.sleep(0.1)
+                scanned_rows = 0
+                queued_total = 0
+                chunk: list[str] = []
+                last_log_ts = time.time()
+
+                while True:
+                    rows = result.fetchmany(db_fetch_size)
+                    if not rows:
+                        break
+
+                    scanned_rows += len(rows)
+                    for row in rows:
+                        addr = row[0]
+                        if isinstance(addr, str) and addr:
+                            chunk.append(addr)
+
+                    if len(chunk) >= enqueue_chunk_size:
+                        to_process = list(set(chunk))
+                        queued_total += len(to_process)
+                        chunk.clear()
+                        await self.update_balance_from_rpc(to_process, 10)
+                        await asyncio.sleep(0)
+
+                    now = time.time()
+                    if now - last_log_ts >= log_every_seconds:
+                        _logger.info(
+                            "Full balance refresh progress (non-threaded): "
+                            f"scanned_rows={scanned_rows}, queued={queued_total}"
+                        )
+                        last_log_ts = now
+
+                if chunk:
+                    to_process = list(set(chunk))
+                    queued_total += len(to_process)
+                    await self.update_balance_from_rpc(to_process, 10)
+
+                _logger.info(
+                    "Full balance refresh complete (non-threaded). "
+                    f"scanned_rows={scanned_rows}, processed_unique~={queued_total}"
+                )
 
             except Exception as e:
                 _logger.error(f"Error updating balances: {e}")
