@@ -145,10 +145,21 @@ async def main():
     env_update_balance_only_str = os.getenv('UPDATE_BALANCE_ONLY', 'False')
     env_update_balance_only = env_update_balance_only_str.lower() in ['true', '1', 't', 'y', 'yes']
     if env_update_balance_only:
-        _logger.info('UPDATE_BALANCE_ONLY enabled: running periodic full balance refresh.')
+        refresh_every_seconds = int(os.getenv('BALANCE_ONLY_REFRESH_SECONDS', '1800'))
+        _logger.info(
+            'UPDATE_BALANCE_ONLY enabled: running periodic full balance refresh every %ss.',
+            refresh_every_seconds,
+        )
         while True:
+            started = time.time()
             await bap.update_all_balances()
-            await asyncio.sleep(1800)
+            duration = time.time() - started
+            _logger.info(
+                'UPDATE_BALANCE_ONLY: refresh cycle queued in %.2fs; sleeping %ss.',
+                duration,
+                refresh_every_seconds,
+            )
+            await asyncio.sleep(refresh_every_seconds)
 
     # create instances of blocksprocessor and virtualchainprocessor
     vcp = VirtualChainProcessor(client, start_block, start_hash)
