@@ -21,6 +21,7 @@ _logger = logging.getLogger(__name__)
 
 # For 1 BPS
 CLUSTER_SIZE = 5
+CATCH_UP_CLUSTER_SIZE = 403
 CLUSTER_WAIT_SECONDS = 15
 
 B_TREE_SIZE = 2500
@@ -60,9 +61,7 @@ class BlocksProcessor(object):
                 await self.vcp.set_start_block(block, block_hash)
                 self.start_hash_set = True
             # if cluster size is reached, insert to database
-            cluster_size = CLUSTER_SIZE
-            if not self.synced:
-                cluster_size = 403
+            cluster_size = CATCH_UP_CLUSTER_SIZE if not self.synced else CLUSTER_SIZE
             if len(self.blocks_to_add) >= cluster_size:
                 _logger.debug(f'Committing {cluster_size} blocks at {block_hash}')
                 await self.commit_blocks()
@@ -129,6 +128,7 @@ class BlocksProcessor(object):
                         block_hashes = block_response.get("blockHashes", [])
                         _logger.info(f'Received {len(block_hashes)} blocks from getBlocksResponse')
                         blocks = block_response.get("blocks", [])
+                        self.synced = False
                         for i, blockHash in enumerate(block_hashes):
                             if daginfo["getBlockDagInfoResponse"]["tipHashes"][0] == blockHash:
                                 _logger.info('Found tip hash. Generator is synced now.')
@@ -150,7 +150,6 @@ class BlocksProcessor(object):
                     _logger.error("No valid response from getBlocksRequest. Skipping this iteration and waiting before retry.")
                     await asyncio.sleep(CLUSTER_WAIT_SECONDS * 2)
                     break  # Exit the generator gracefully instead of crashing
-            await asyncio.sleep(1)
 
     async def __add_tx_to_queue(self, block_hash, block):
         """
@@ -183,7 +182,7 @@ class BlocksProcessor(object):
                         for index, out in enumerate(transaction.get("outputs", [])):
                             address = out["verboseData"].get("scriptPublicKeyAddress")
                             amount = out["amount"]
-                            if self.env_enable_balance != False: 
+                            if self.env_enable_balance != False and self.synced == True: 
                                 if address not in self.addresses_to_update:
                                     self.addresses_to_update.append(address)
                             self.txs_output.append(TransactionOutput(transaction_id=tx_id,
@@ -194,7 +193,7 @@ class BlocksProcessor(object):
                                                                     script_public_key_type=out["verboseData"].get("scriptPublicKeyType")))
 
                         for index, tx_in in enumerate(transaction.get("inputs", [])):
-                            if self.env_enable_balance != False: 
+                            if self.env_enable_balance != False and self.synced == True: 
                                 prev_out_tx_id = tx_in["previousOutpoint"]["transactionId"]
                                 prev_out_index = int(tx_in["previousOutpoint"].get("index", 0))
                                 with session_maker() as session:
