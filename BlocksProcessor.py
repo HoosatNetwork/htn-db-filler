@@ -21,7 +21,7 @@ _logger = logging.getLogger(__name__)
 
 # For 1 BPS
 CLUSTER_SIZE = 5
-CATCH_UP_CLUSTER_SIZE = 403
+CATCH_UP_CLUSTER_SIZE = 1000
 CLUSTER_WAIT_SECONDS = 15
 
 B_TREE_SIZE = 2500
@@ -148,8 +148,8 @@ class BlocksProcessor(object):
                             _logger.info('New low hash block %s.', low_hash)
                 else:
                     _logger.error("No valid response from getBlocksRequest. Skipping this iteration and waiting before retry.")
-                    await asyncio.sleep(CLUSTER_WAIT_SECONDS * 2)
-                    break  # Exit the generator gracefully instead of crashing
+                    await asyncio.sleep(1)
+                    continue  # Retry instead of exiting the generator
 
     async def __add_tx_to_queue(self, block_hash, block):
         """
