@@ -1,6 +1,7 @@
 # encoding: utf-8
 
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 
@@ -8,9 +9,13 @@ from dbsession import session_maker
 from helper import KeyValueStore
 from models.TxAddrMapping import TxAddrMapping
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
-LIMIT = 1000
-PRECONDITION_RETRIES = 2
+LIMIT = int(os.getenv("TX_ADDR_MAPPING_LIMIT", "500"))
+PRECONDITION_RETRIES = int(os.getenv("TX_ADDR_MAPPING_RETRIES", "3"))
+# Timeouts to avoid waiting long on DB locks (milliseconds)
+LOCK_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_LOCK_TIMEOUT_MS", "200"))
+STATEMENT_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_STATEMENT_TIMEOUT_MS", "5000"))
 
 _logger = logging.getLogger(__name__)
 
@@ -101,56 +106,98 @@ class TxAddrMappingUpdater(object):
             return start_block_time
 
     def update_inputs(self, min_id: int, max_id: int):
-        with session_maker() as s:
+        attempts = 0
+        result = None
+        insert_sql = text(f"""
+            INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
 
-            result = s.execute(text(f"""INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
+            SELECT DISTINCT * FROM (
+                SELECT transactions_inputs.transaction_id,
+                       transactions_outputs.script_public_key_address,
+                       transactions.block_time FROM transactions_inputs 
+                LEFT JOIN transactions_outputs ON 
 
-                SELECT DISTINCT * FROM (
-                    SELECT transactions_inputs.transaction_id,
-                           transactions_outputs.script_public_key_address,
-                           transactions.block_time FROM transactions_inputs 
-                    LEFT JOIN transactions_outputs ON 
-                    
-                        transactions_outputs.transaction_id = transactions_inputs.previous_outpoint_hash AND
-                        transactions_outputs.index = transactions_inputs.previous_outpoint_index
-                    
-                    LEFT JOIN transactions ON transactions.transaction_id = transactions_inputs.transaction_id
-                        
-                    WHERE transactions_inputs.id > :minId AND transactions_inputs.id <= :maxId
-                       AND transactions_outputs.script_public_key_address IS NOT NULL
-                    ORDER by transactions_inputs.id
-                    ) as distinct_query
-                    
-                 ON CONFLICT DO NOTHING
-                         RETURNING block_time;"""), {"minId": min_id, "maxId": max_id})
+                    transactions_outputs.transaction_id = transactions_inputs.previous_outpoint_hash AND
+                    transactions_outputs.index = transactions_inputs.previous_outpoint_index
 
-            s.commit()
+                LEFT JOIN transactions ON transactions.transaction_id = transactions_inputs.transaction_id
+
+                WHERE transactions_inputs.id > :minId AND transactions_inputs.id <= :maxId
+                   AND transactions_outputs.script_public_key_address IS NOT NULL
+                ORDER by transactions_inputs.id
+                ) as distinct_query
+
+             ON CONFLICT DO NOTHING
+                     RETURNING block_time;
+        """)
+
+        while True:
+            attempts += 1
+            try:
+                with session_maker() as s:
+                    # avoid blocking on locks for long periods
+                    try:
+                        s.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"))
+                        s.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT_MS}ms'"))
+                    except Exception:
+                        # not fatal; continue without local timeouts
+                        _logger.debug('Could not set local DB timeouts for update_inputs')
+
+                    result = s.execute(insert_sql, {"minId": min_id, "maxId": max_id})
+                    s.commit()
+                break
+            except OperationalError as e:
+                _logger.warning(f"update_inputs: DB operation timed out/locked (attempt %s): %s", attempts, e)
+                if attempts >= PRECONDITION_RETRIES:
+                    raise
+                time.sleep(0.5 * attempts)
+                continue
 
         try:
-            result = result.all()
-            return len(result), result[-1][0]
-        except IndexError:
+            rows = result.all()
+            return len(rows), rows[-1][0]
+        except (IndexError, TypeError):
             return 0, None
 
     def update_outputs(self, min_id: int, max_id: int):
-        with session_maker() as s:
-            result = s.execute(text(f"""
-            
-                INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
-                
-                (SELECT sq.*, transactions.block_time FROM (SELECT transaction_id, script_public_key_address                 
-                FROM transactions_outputs
-                WHERE transactions_outputs.id > :minId and transactions_outputs.id <= :maxId
-                ORDER by transactions_outputs.id DESC) as sq
-				JOIN transactions ON transactions.transaction_id = sq.transaction_id)
-                
-                 ON CONFLICT DO NOTHING
-                 RETURNING block_time;"""), {"minId": min_id, "maxId": max_id})
+        attempts = 0
+        result = None
+        insert_sql = text(f"""
 
-            s.commit()
+            INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
+
+            (SELECT sq.*, transactions.block_time FROM (SELECT transaction_id, script_public_key_address                 
+            FROM transactions_outputs
+            WHERE transactions_outputs.id > :minId and transactions_outputs.id <= :maxId
+            ORDER by transactions_outputs.id DESC) as sq
+            JOIN transactions ON transactions.transaction_id = sq.transaction_id)
+
+             ON CONFLICT DO NOTHING
+             RETURNING block_time;
+        """)
+
+        while True:
+            attempts += 1
+            try:
+                with session_maker() as s:
+                    try:
+                        s.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"))
+                        s.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT_MS}ms'"))
+                    except Exception:
+                        _logger.debug('Could not set local DB timeouts for update_outputs')
+
+                    result = s.execute(insert_sql, {"minId": min_id, "maxId": max_id})
+                    s.commit()
+                break
+            except OperationalError as e:
+                _logger.warning(f"update_outputs: DB operation timed out/locked (attempt %s): %s", attempts, e)
+                if attempts >= PRECONDITION_RETRIES:
+                    raise
+                time.sleep(0.5 * attempts)
+                continue
 
         try:
-            result = result.all()
-            return len(result), result[-1][0]
-        except IndexError:
+            rows = result.all()
+            return len(rows), rows[-1][0]
+        except (IndexError, TypeError):
             return 0, None

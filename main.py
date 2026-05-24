@@ -166,22 +166,35 @@ async def main():
     bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
 
     # start blocks processor working concurrent
+    restart_attempts = 0
     while True:
         try:
             await bp.loop(start_hash)
+            # If the loop returns without exception, restart gracefully
+            _logger.error('BlocksProcessor.loop exited unexpectedly without exception. Restarting in 5s.')
+            await asyncio.sleep(5)
+            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
+            restart_attempts = 0
+            continue
         except Exception:
-            _logger.exception('Exception occured and script crashed..')
-            break  # Exit the loop cleanly if an unexpected error occurs
-        else:
-            _logger.error('BlocksProcessor.loop exited unexpectedly. Exiting main loop.')
-            break
+            restart_attempts += 1
+            backoff = min(60, 2 ** min(restart_attempts, 6))
+            _logger.exception('BlocksProcessor.loop crashed; restarting after %ss (attempt %s).', backoff, restart_attempts)
+            await asyncio.sleep(backoff)
+            # recreate the processor to ensure a clean state
+            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
+            continue
 
 
 if __name__ == '__main__':
     update_balance_only_str = os.getenv('UPDATE_BALANCE_ONLY', 'False')
     update_balance_only = update_balance_only_str.lower() in ['true', '1', 't', 'y', 'yes']
 
-    tx_addr_mapping_updater = TxAddrMappingUpdater()
+    # Optionally start legacy TxAddrMappingUpdater thread. Disabled by default.
+    start_updater_str = os.getenv('START_TX_ADDR_MAPPING_UPDATER', 'False')
+    start_updater = start_updater_str.lower() in ['true', '1', 't', 'y', 'yes']
+
+    tx_addr_mapping_updater = None
 
     # custom exception hook for thread
     def custom_hook(args):
@@ -192,21 +205,28 @@ if __name__ == '__main__':
 
         # check if TxAddrMappingUpdater
         if thread.name == 'TxAddrMappingUpdater':
-            p = threading.Thread(target=tx_addr_mapping_updater.loop, daemon=True, name="TxAddrMappingUpdater")
-            p.start()
-            raise Exception("TxAddrMappingUpdater thread crashed.")
+            if tx_addr_mapping_updater is not None:
+                p = threading.Thread(target=tx_addr_mapping_updater.loop, daemon=True, name="TxAddrMappingUpdater")
+                p.start()
+                raise Exception("TxAddrMappingUpdater thread crashed.")
+            else:
+                _logger.error('TxAddrMappingUpdater thread crashed but updater is disabled.')
+                raise Exception('TxAddrMappingUpdater thread crashed but updater is disabled.')
 
 
     # set the exception hook
     threading.excepthook = custom_hook
 
-    if not update_balance_only:
-        # run TxAddrMappingUpdater
-        # will be rerun
-        _logger.info('Starting updater thread now.')
+    if not update_balance_only and start_updater:
+        # run TxAddrMappingUpdater (legacy), only when explicitly enabled
+        tx_addr_mapping_updater = TxAddrMappingUpdater()
+        _logger.info('Starting updater thread now (legacy behavior).')
         threading.Thread(target=tx_addr_mapping_updater.loop, daemon=True, name="TxAddrMappingUpdater").start()
     else:
-        _logger.info('UPDATE_BALANCE_ONLY enabled: skipping TxAddrMappingUpdater thread.')
+        if not start_updater:
+            _logger.info('START_TX_ADDR_MAPPING_UPDATER not enabled: skipping legacy TxAddrMappingUpdater thread.')
+        else:
+            _logger.info('UPDATE_BALANCE_ONLY enabled: skipping TxAddrMappingUpdater thread.')
 
     _logger.info('Starting main thread now.')
 
