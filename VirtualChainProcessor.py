@@ -45,6 +45,8 @@ class VirtualChainProcessor(object):
         parent_chain_blocks = []
         if parent_chain_response is not None:
             _logger.debug("Updating transactions in db")
+            accepted_tx_list = parent_chain_response.get('acceptedTransactionIds', [])
+            _logger.info(f'VCP: received {len(accepted_tx_list)} acceptedTransactionIds; building parent chain list')
             if 'acceptedTransactionIds' in parent_chain_response and len(parent_chain_response['acceptedTransactionIds']) > 0:
                 for transaction in parent_chain_response['acceptedTransactionIds']:
                     if 'acceptingBlockHash' in transaction:
@@ -52,10 +54,13 @@ class VirtualChainProcessor(object):
 
                 # find intersection of database blocks and virtual parent chain
                 with session_maker() as s:
-                    parent_chain_blocks_in_db = s.query(Block) \
-                        .filter(Block.hash.in_(parent_chain_blocks)) \
-                        .with_entities(Block.hash).all()
-                    parent_chain_blocks_in_db = [x[0] for x in parent_chain_blocks_in_db]
+                    parent_chain_blocks_in_db = []
+                    CHUNK = 500
+                    if parent_chain_blocks:
+                        for i in range(0, len(parent_chain_blocks), CHUNK):
+                            chunk = parent_chain_blocks[i:i + CHUNK]
+                            rows = s.query(Block).filter(Block.hash.in_(chunk)).with_entities(Block.hash).all()
+                            parent_chain_blocks_in_db.extend([x[0] for x in rows])
 
                 # parent_chain_blocks_in_db = parent_chain_blocks_in_db[:200]
 
@@ -75,22 +80,33 @@ class VirtualChainProcessor(object):
 
                 # add rejected blocks if needed
                 rejected_blocks.extend(parent_chain_response.get('removedChainBlockHashes', []))
+                _logger.info(f'VCP: {len(rejected_blocks)} removedChainBlockHashes to process')
 
                 with session_maker() as s:
                     # set is_accepted to False, when blocks were removed from virtual parent chain
+                    CHUNK = 500
                     if rejected_blocks:
-                        count = s.query(Transaction).filter(Transaction.accepting_block_hash.in_(rejected_blocks)) \
-                            .update({'is_accepted': False, 'accepting_block_hash': None})
-                        _logger.info(f'Set is_accepted=False for {count} TXs')
+                        total = 0
+                        for i in range(0, len(rejected_blocks), CHUNK):
+                            chunk = rejected_blocks[i:i + CHUNK]
+                            # use synchronize_session=False for bulk update
+                            c = s.query(Transaction).filter(Transaction.accepting_block_hash.in_(chunk)) \
+                                .update({'is_accepted': False, 'accepting_block_hash': None}, synchronize_session=False)
+                            total += c
+                        _logger.info(f'Set is_accepted=False for {total} TXs')
                         s.commit()
 
-                    count_tx = 0    
+                    count_tx = 0
 
                     # set is_accepted to True and add accepting_block_hash
                     for accepting_block_hash, accepted_tx_ids in accepted_ids:
-                        s.query(Transaction).filter(Transaction.transaction_id.in_(accepted_tx_ids)) \
-                            .update({'is_accepted': True, 'accepting_block_hash': accepting_block_hash})
-                        count_tx += len(accepted_tx_ids)
+                        if not accepted_tx_ids:
+                            continue
+                        for i in range(0, len(accepted_tx_ids), CHUNK):
+                            chunk = accepted_tx_ids[i:i + CHUNK]
+                            c = s.query(Transaction).filter(Transaction.transaction_id.in_(chunk)) \
+                                .update({'is_accepted': True, 'accepting_block_hash': accepting_block_hash}, synchronize_session=False)
+                            count_tx += c
 
                     _logger.info(f'Set is_accepted=True for {count_tx} transactions.')
                     s.commit()

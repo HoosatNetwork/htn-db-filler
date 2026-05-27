@@ -30,6 +30,7 @@ class TxAddrMappingUpdater(object):
         with session_maker() as s:
             self.id_counter_inputs = int(KeyValueStore.get("last_id_counter_inputs") or 0)
             self.id_counter_outputs = int(KeyValueStore.get("last_id_counter_outputs") or 0)
+        _logger.info(f"TxAddrMappingUpdater precondition: starting inputs={self.id_counter_inputs}, outputs={self.id_counter_outputs}")
 
     @staticmethod
     def minimum_timestamp():
@@ -46,24 +47,25 @@ class TxAddrMappingUpdater(object):
             # get max id ( either LIMIT or maximum in DB )
             if self.id_counter_inputs is not None and self.id_counter_outputs is not None:
                 with session_maker() as s:
-                    max_in = min(self.id_counter_inputs + LIMIT,
-                                s.execute(
-                                    text(f"""SELECT id FROM transactions_inputs ORDER by id DESC LIMIT 1"""))
-                                .scalar() or 0)
+                    db_max_in = s.execute(text("SELECT id FROM transactions_inputs ORDER by id DESC LIMIT 1")).scalar() or 0
+                    max_in = min(self.id_counter_inputs + LIMIT, db_max_in)
 
-                    max_out = min(self.id_counter_outputs + LIMIT,
-                                s.execute(
-                                    text(f"""SELECT id FROM transactions_outputs ORDER by id DESC LIMIT 1"""))
-                                .scalar() or 0)
+                    db_max_out = s.execute(text("SELECT id FROM transactions_outputs ORDER by id DESC LIMIT 1")).scalar() or 0
+                    max_out = min(self.id_counter_outputs + LIMIT, db_max_out)
+
+                _logger.debug(f"TxAddrMappingUpdater: db_max_in={db_max_in}, db_max_out={db_max_out}, planned max_in={max_in}, max_out={max_out}")
 
                 try:
+                    _logger.info(f"TxAddrMappingUpdater: updating outputs ids >{self.id_counter_outputs} <={max_out}")
                     count_outputs, new_last_block_time_outputs = self.update_outputs(self.id_counter_outputs,
                                                                                     max_out)
+                    _logger.info(f"TxAddrMappingUpdater: updating inputs ids >{self.id_counter_inputs} <={max_in}")
                     count_inputs, new_last_block_time_inputs = self.update_inputs(self.id_counter_inputs,
                                                                                 max_in)
                     # save last runs ids in case of restart
                     KeyValueStore.set("last_id_counter_inputs", max_in)
                     KeyValueStore.set("last_id_counter_outputs", max_out)
+                    _logger.debug(f"TxAddrMappingUpdater: saved last counters inputs={max_in}, outputs={max_out}")
 
                 except Exception:
                     error_cnt += 1
@@ -133,6 +135,7 @@ class TxAddrMappingUpdater(object):
 
         while True:
             attempts += 1
+            _logger.debug(f"update_inputs: attempt {attempts} for ids >{min_id} <={max_id}")
             try:
                 with session_maker() as s:
                     # avoid blocking on locks for long periods
@@ -143,8 +146,11 @@ class TxAddrMappingUpdater(object):
                         # not fatal; continue without local timeouts
                         _logger.debug('Could not set local DB timeouts for update_inputs')
 
+                    start = time.time()
                     result = s.execute(insert_sql, {"minId": min_id, "maxId": max_id})
                     s.commit()
+                    duration = time.time() - start
+                    _logger.info(f"update_inputs: executed insert for ids >{min_id} <={max_id} in {duration:.3f}s")
                 break
             except OperationalError as e:
                 _logger.warning(f"update_inputs: DB operation timed out/locked (attempt %s): %s", attempts, e)
@@ -155,6 +161,7 @@ class TxAddrMappingUpdater(object):
 
         try:
             rows = result.all()
+            _logger.debug(f"update_inputs: inserted {len(rows)} rows; last_block_time={rows[-1][0] if rows else None}")
             return len(rows), rows[-1][0]
         except (IndexError, TypeError):
             return 0, None
@@ -166,7 +173,7 @@ class TxAddrMappingUpdater(object):
 
             INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
 
-            (SELECT sq.*, transactions.block_time FROM (SELECT transaction_id, script_public_key_address                 
+            (SELECT sq.*, transactions.block_time FROM (SELECT transactions_outputs.transaction_id, transactions_outputs.script_public_key_address                 
             FROM transactions_outputs
             WHERE transactions_outputs.id > :minId and transactions_outputs.id <= :maxId
             ORDER by transactions_outputs.id DESC) as sq
@@ -178,6 +185,7 @@ class TxAddrMappingUpdater(object):
 
         while True:
             attempts += 1
+            _logger.debug(f"update_outputs: attempt {attempts} for ids >{min_id} <={max_id}")
             try:
                 with session_maker() as s:
                     try:
@@ -186,8 +194,11 @@ class TxAddrMappingUpdater(object):
                     except Exception:
                         _logger.debug('Could not set local DB timeouts for update_outputs')
 
+                    start = time.time()
                     result = s.execute(insert_sql, {"minId": min_id, "maxId": max_id})
                     s.commit()
+                    duration = time.time() - start
+                    _logger.info(f"update_outputs: executed insert for ids >{min_id} <={max_id} in {duration:.3f}s")
                 break
             except OperationalError as e:
                 _logger.warning(f"update_outputs: DB operation timed out/locked (attempt %s): %s", attempts, e)
@@ -198,6 +209,7 @@ class TxAddrMappingUpdater(object):
 
         try:
             rows = result.all()
+            _logger.debug(f"update_outputs: inserted {len(rows)} rows; last_block_time={rows[-1][0] if rows else None}")
             return len(rows), rows[-1][0]
         except (IndexError, TypeError):
             return 0, None
