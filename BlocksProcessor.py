@@ -241,26 +241,49 @@ class BlocksProcessor(object):
 
         # Handle updates for existing transactions in batches
         for i in range(num_batches):
-            with session_maker() as session:
-                # Determine the subset of transaction IDs for this batch
-                batch_tx_ids = tx_ids_to_add[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
+            # Determine the subset of transaction IDs for this batch
+            batch_tx_ids = tx_ids_to_add[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
 
-                # Query only the transactions in the current batch
-                tx_items = session.query(Transaction).filter(Transaction.transaction_id.in_(batch_tx_ids)).all()
+            if not batch_tx_ids:
+                continue
 
-                for tx_item in tx_items:
-                    # Update block_hash by combining existing ones with new ones from self.txs
-                    new_block_hashes = list(set(tx_item.block_hash) | set(self.txs[tx_item.transaction_id].block_hash))
-                    tx_item.block_hash = new_block_hashes
-                    # Remove the transaction from self.txs since it's now been processed
-                    self.txs.pop(tx_item.transaction_id)
-
-                # Commit the updates for this batch
+            # Try once, and retry one time if we hit a transient "aborted transaction"/connection state.
+            for attempt in range(2):
+                session = session_maker()
                 try:
+                    # Query only the transactions in the current batch
+                    tx_items = session.query(Transaction).filter(Transaction.transaction_id.in_(batch_tx_ids)).all()
+
+                    for tx_item in tx_items:
+                        # Update block_hash by combining existing ones with new ones from self.txs
+                        if tx_item.transaction_id in self.txs:
+                            new_block_hashes = list(set(tx_item.block_hash) | set(self.txs[tx_item.transaction_id].block_hash))
+                            tx_item.block_hash = new_block_hashes
+                            # Remove the transaction from self.txs since it's now been processed
+                            self.txs.pop(tx_item.transaction_id)
+
+                    # Commit the updates for this batch
                     session.commit()
+                    session.close()
+                    break
                 except Exception as e:
-                    session.rollback()
-                    _logger.error(f'Error updating transactions in batch {i+1}/{num_batches}: {e}')
+                    # Ensure the session/connection is cleaned up and not returned to pool in an aborted state
+                    try:
+                        session.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+
+                    if attempt == 0:
+                        _logger.warning(f"Transient DB error during update of tx batch {i+1}/{num_batches}: {e}. Rolling back and retrying once.")
+                        await asyncio.sleep(0.5)
+                        continue
+                    else:
+                        _logger.error(f'Error updating transactions in batch {i+1}/{num_batches} after retry: {e}')
+                        break
 
         # Pre-map outputs and inputs to their transaction IDs for new transactions
         outputs_by_tx = {tx_id: [] for tx_id in self.txs.keys()}
@@ -409,7 +432,25 @@ class BlocksProcessor(object):
             if tx_ids_to_add:
                 for i in range(0, len(tx_ids_to_add), CHUNK):
                     chunk = tx_ids_to_add[i:i + CHUNK]
-                    tx_items.extend(session.query(Transaction).filter(Transaction.transaction_id.in_(chunk)).all())
+                    # Run the chunked SELECT with a single retry to avoid failing on a connection
+                    # that was returned to the pool in an aborted state.
+                    for attempt in range(2):
+                        try:
+                            rows = session.query(Transaction).filter(Transaction.transaction_id.in_(chunk)).all()
+                            tx_items.extend(rows)
+                            break
+                        except Exception as e:
+                            try:
+                                session.rollback()
+                            except Exception:
+                                pass
+                            _logger.warning(f"Transient DB error selecting transactions chunk {i}/{len(tx_ids_to_add)}: {e}. Retrying once.")
+                            if attempt == 0:
+                                await asyncio.sleep(0.25)
+                                continue
+                            else:
+                                _logger.error(f"Failed selecting transactions chunk after retry: {e}")
+                                break
 
             # Update existing transactions (if any) and remove them from the queue
             for tx_item in tx_items:
@@ -583,8 +624,24 @@ class BlocksProcessor(object):
                 if block_hashes:
                     for i in range(0, len(block_hashes), CHUNK):
                         chunk = block_hashes[i:i + CHUNK]
-                        rows = session.query(Block.hash).filter(Block.hash.in_(chunk)).all()
-                        existing_hashes.update({h[0] for h in rows})
+                        # Retry once on transient DB errors to avoid leaving connections in aborted state
+                        for attempt in range(2):
+                            try:
+                                rows = session.query(Block.hash).filter(Block.hash.in_(chunk)).all()
+                                existing_hashes.update({h[0] for h in rows})
+                                break
+                            except Exception as e:
+                                try:
+                                    session.rollback()
+                                except Exception:
+                                    pass
+                                _logger.warning(f"Transient DB error selecting block hashes chunk {i}/{len(block_hashes)}: {e}. Retrying once.")
+                                if attempt == 0:
+                                    await asyncio.sleep(0.25)
+                                    continue
+                                else:
+                                    _logger.error(f"Failed selecting block hashes after retry: {e}")
+                                    break
                 
                 # Only add blocks that don't exist
                 for block in self.blocks_to_add:
