@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import SQLAlchemyError, OperationalError
 from sqlalchemy import text, bindparam
 
-from dbsession import session_maker
+from dbsession import session_maker, engine
 from models.Block import Block
 from models.Transaction import Transaction, TransactionOutput, TransactionInput
 from utils.Event import Event
@@ -27,6 +27,9 @@ CATCH_UP_CLUSTER_SIZE = 500
 CLUSTER_WAIT_SECONDS = 1
 
 B_TREE_SIZE = 2500
+
+# Number of blocks to insert per DB batch. Use smaller batches to avoid large executemany failures.
+BLOCK_COMMIT_BATCH = int(os.getenv("BLOCK_COMMIT_BATCH", "100"))
 
 # DB timeouts for best-effort mapping inserts (milliseconds)
 LOCK_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_LOCK_TIMEOUT_MS", "200"))
@@ -55,6 +58,10 @@ class BlocksProcessor(object):
 
         # Did the loop already see the DAG tip
         self.synced = False
+
+        # NEW: Track last processed block time to prevent going backwards
+        self.last_block_time = 0
+        self.max_time_drift_seconds = 3600 * 0.5
 
     async def loop(self, start_point):
         # go through each block added to DAG
@@ -112,51 +119,79 @@ class BlocksProcessor(object):
         task_runner = asyncio.create_task(self.vcp.yield_to_database())
 
     async def blockiter(self, start_point):
-        """
-        generator for iterating the blocks added to the blockDAG
-        """
         low_hash = start_point
         while True:
             _logger.info('Requesting with low hash block %s.', low_hash)
             daginfo = await self.client.request("getBlockDagInfoRequest", {})
-            if daginfo is not None:
-                start_req = time.time()
-                resp = await self.client.request("getBlocksRequest",
-                                                params={
-                                                    "lowHash": low_hash,
-                                                    "includeTransactions": True,
-                                                    "includeBlocks": True
-                                                },
-                                                timeout=30)
-                req_duration = time.time() - start_req
-                _logger.debug(f'getBlocksRequest took {req_duration:.3f}s for lowHash {low_hash}')
-                # go through each block and yield
-                if resp is not None:
-                    block_response = resp.get("getBlocksResponse", None)
-                    if block_response is not None:
-                            block_hashes = block_response.get("blockHashes", [])
-                            _logger.info(f'Received {len(block_hashes)} blocks from getBlocksResponse')
-                            blocks = block_response.get("blocks", [])
-                    for i, blockHash in enumerate(block_hashes):
-                        if daginfo["getBlockDagInfoResponse"]["tipHashes"][0] == blockHash:
-                            _logger.info('Found tip hash. Generator is synced now.')
-                            self.synced = True
-                            break # Dont iterate over the tipHash, because getBlock request returns old blocks. 
-                        # yield blockhash and it's data
-                        yield blockHash, blocks[i]
-                    if self.synced: 
-                        low_hash = daginfo["getBlockDagInfoResponse"]["tipHashes"][0]
-                        _logger.info(f'Waiting for the next blocks request.')
-                        await asyncio.sleep(CLUSTER_WAIT_SECONDS)
-                        _logger.info('New low hash block %s.', low_hash)
+            if daginfo is None:
+                await asyncio.sleep(2)
+                continue
+
+            tip_hash = daginfo["getBlockDagInfoResponse"]["tipHashes"][0]
+            start_req = time.time()
+            resp = await self.client.request("getBlocksRequest", {
+                "lowHash": low_hash,
+                "includeTransactions": True,
+                "includeBlocks": True
+            }, timeout=30)
+            req_duration = time.time() - start_req
+            _logger.debug(f'getBlocksRequest took {req_duration:.3f}s for lowHash {low_hash[:8]}...')
+
+            if resp is None:
+                _logger.error("No valid response from getBlocksRequest. Retrying...")
+                await asyncio.sleep(2)
+                continue
+
+            block_response = resp.get("getBlocksResponse", {})
+            block_hashes = block_response.get("blockHashes", [])
+            blocks = block_response.get("blocks", [])
+
+            _logger.info(f'Received {len(block_hashes)} blocks. Tip: {tip_hash[:8]}...')
+
+            advanced = False
+            for i, blockHash in enumerate(block_hashes):
+                block_data = blocks[i]
+                block_time = int(block_data["header"]["timestamp"]) // 1000
+
+                # NEW: Strong time-based guard
+                if self.last_block_time > 0 and block_time < self.last_block_time - self.max_time_drift_seconds:
+                    _logger.warning(f"Block {blockHash[:8]}... has old timestamp ({block_time}). Skipping.")
+                    continue
+
+                if blockHash == tip_hash:
+                    _logger.info('Found tip hash. Generator is synced now.')
+                    self.synced = True
+                    break
+
+                # Yield the block
+                yield blockHash, block_data
+
+                # Update last seen time
+                if block_time >= self.last_block_time:
+                    self.last_block_time = block_time
+
+                advanced = True
+
+            # Update low_hash safely
+            if self.synced:
+                low_hash = tip_hash
+                _logger.info(f'Synced to tip. Waiting {CLUSTER_WAIT_SECONDS}s...')
+                await asyncio.sleep(CLUSTER_WAIT_SECONDS)
+            else:
+                if advanced and block_hashes:
+                    # Only advance to the last *newer* block
+                    last_hash = block_hashes[-1]
+                    last_time = int(blocks[-1]["header"]["timestamp"]) // 1000
+                    if last_time >= self.last_block_time - 60:  # small tolerance
+                        low_hash = last_hash
+                        self.last_block_time = max(self.last_block_time, last_time)
                     else:
-                        if len(block_hashes) > 1:
-                            low_hash = block_hashes[len(block_hashes) - 1]
-                        _logger.info('New low hash block %s.', low_hash)
+                        _logger.warning(f"Last returned block is old ({last_time}). Keeping current low_hash.")
                 else:
-                    _logger.error("No valid response from getBlocksRequest. Skipping this iteration and waiting before retry.")
-                    await asyncio.sleep(1)
-                    continue  # Retry instead of exiting the generator
+                    _logger.info("No progress. Waiting...")
+                    await asyncio.sleep(3)
+
+            _logger.info(f'New low hash: {low_hash[:8]}... (last block time: {self.last_block_time})')
 
     async def __add_tx_to_queue(self, block_hash, block):
         """
@@ -265,6 +300,7 @@ class BlocksProcessor(object):
                     # Commit the updates for this batch
                     session.commit()
                     session.close()
+                    _logger.info(f'Committed {len(batch_tx_ids)} transactions in batch {i+1}-{min(i+BATCH_SIZE, len(tx_ids_to_add))}')
                     break
                 except Exception as e:
                     # Ensure the session/connection is cleaned up and not returned to pool in an aborted state
@@ -274,6 +310,18 @@ class BlocksProcessor(object):
                         pass
                     try:
                         session.close()
+                    except Exception:
+                        pass
+
+                    # If this looks like an aborted transaction state, dispose the engine
+                    try:
+                        msg = str(e) or repr(e)
+                        if 'InFailedSqlTransaction' in msg or 'current transaction is aborted' in msg:
+                            _logger.warning('Detected aborted DB transaction state; disposing engine pool to reset connections')
+                            try:
+                                engine.dispose()
+                            except Exception as de:
+                                _logger.error(f'Error disposing engine: {de}')
                     except Exception:
                         pass
 
@@ -323,6 +371,7 @@ class BlocksProcessor(object):
                     # inserts in a separate session after commit so failures do not affect
                     # the committed data.
                     session.commit()
+                    _logger.info(f'Committed {len(batch_tx_ids)} new transactions in batch {i+1}-{min(i+BATCH_SIZE, len(all_new_txs))}')
 
                     # Attempt mapping inserts in a separate session (non-fatal)
                     if batch_tx_ids:
@@ -385,7 +434,8 @@ class BlocksProcessor(object):
                                 """
                                 ).bindparams(bindparam("tx_ids", expanding=True))
 
-                                _execute_mapping_with_retries_map(map_sess, stmt_out, {"tx_ids": batch_tx_ids})
+                                success_out = _execute_mapping_with_retries_map(map_sess, stmt_out, {"tx_ids": batch_tx_ids})
+                                _logger.info(f'Outputs mapping insert success={success_out} for {len(batch_tx_ids)} txs')
 
                                 stmt_in = text("""
                                     INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
@@ -400,7 +450,8 @@ class BlocksProcessor(object):
                                 """
                                 ).bindparams(bindparam("tx_ids", expanding=True))
 
-                                _execute_mapping_with_retries_map(map_sess, stmt_in, {"tx_ids": batch_tx_ids})
+                                success_in = _execute_mapping_with_retries_map(map_sess, stmt_in, {"tx_ids": batch_tx_ids})
+                                _logger.info(f'Inputs mapping insert success={success_in} for {len(batch_tx_ids)} txs')
                         except OperationalError as e:
                             _logger.warning(f"Batch mapping insert skipped due to DB lock/timeout (separate session): {e}")
                         except Exception as e:
@@ -444,6 +495,18 @@ class BlocksProcessor(object):
                                 session.rollback()
                             except Exception:
                                 pass
+                            # If this looks like an aborted transaction state, dispose the engine
+                            try:
+                                msg = str(e) or repr(e)
+                                if 'InFailedSqlTransaction' in msg or 'current transaction is aborted' in msg:
+                                    _logger.warning('Detected aborted DB transaction state during select; disposing engine pool to reset connections')
+                                    try:
+                                        engine.dispose()
+                                    except Exception as de:
+                                        _logger.error(f'Error disposing engine: {de}')
+                            except Exception:
+                                pass
+
                             _logger.warning(f"Transient DB error selecting transactions chunk {i}/{len(tx_ids_to_add)}: {e}. Retrying once.")
                             if attempt == 0:
                                 await asyncio.sleep(0.25)
@@ -610,62 +673,124 @@ class BlocksProcessor(object):
 
     async def commit_blocks(self):
         """
-        Insert queued blocks to database only if they don't already exist
+        Insert queued blocks to database only if they don't already exist.
+        To avoid large multi-row insert failures (which can abort the DB
+        transaction), insert in configurable chunks and fall back to
+        per-block inserts when necessary. Failed inserts are kept queued
+        for retry.
         """
-        with session_maker() as session:
-            try:
-                blocks_to_insert = []
-                block_hashes = [b.hash for b in self.blocks_to_add]
-                _logger.debug(f'Checking blocks with hashes: {block_hashes}')
-                
-                # Check which blocks already exist. Chunk large IN-lists to avoid DB parameter limits.
-                existing_hashes = set()
-                CHUNK = 500
-                if block_hashes:
-                    for i in range(0, len(block_hashes), CHUNK):
-                        chunk = block_hashes[i:i + CHUNK]
-                        # Retry once on transient DB errors to avoid leaving connections in aborted state
-                        for attempt in range(2):
-                            try:
-                                rows = session.query(Block.hash).filter(Block.hash.in_(chunk)).all()
+        try:
+            blocks_to_insert = []
+            block_hashes = [b.hash for b in self.blocks_to_add]
+            _logger.debug(f'Checking blocks with hashes: {block_hashes}')
+
+            # Check which blocks already exist. Chunk large IN-lists to avoid DB parameter limits.
+            existing_hashes = set()
+            CHUNK = 500
+            if block_hashes:
+                for i in range(0, len(block_hashes), CHUNK):
+                    chunk = block_hashes[i:i + CHUNK]
+                    # Retry once on transient DB errors
+                    for attempt in range(2):
+                        try:
+                            with session_maker() as s:
+                                rows = s.query(Block.hash).filter(Block.hash.in_(chunk)).all()
                                 existing_hashes.update({h[0] for h in rows})
+                            break
+                        except Exception as e:
+                            # If this looks like an aborted transaction state, dispose the engine
+                            try:
+                                msg = str(e) or repr(e)
+                                if 'InFailedSqlTransaction' in msg or 'current transaction is aborted' in msg:
+                                    _logger.warning('Detected aborted DB transaction state during block-hash select; disposing engine pool to reset connections')
+                                    try:
+                                        engine.dispose()
+                                    except Exception as de:
+                                        _logger.error(f'Error disposing engine: {de}')
+                            except Exception:
+                                pass
+
+                            _logger.warning(f"Transient DB error selecting block hashes chunk {i}/{len(block_hashes)}: {e}. Retrying once.")
+                            if attempt == 0:
+                                await asyncio.sleep(0.25)
+                                continue
+                            else:
+                                _logger.error(f"Failed selecting block hashes after retry: {e}")
                                 break
-                            except Exception as e:
-                                try:
-                                    session.rollback()
-                                except Exception:
-                                    pass
-                                _logger.warning(f"Transient DB error selecting block hashes chunk {i}/{len(block_hashes)}: {e}. Retrying once.")
-                                if attempt == 0:
-                                    await asyncio.sleep(0.25)
-                                    continue
-                                else:
-                                    _logger.error(f"Failed selecting block hashes after retry: {e}")
-                                    break
-                
-                # Only add blocks that don't exist
-                for block in self.blocks_to_add:
-                    if block.hash not in existing_hashes:
-                        blocks_to_insert.append(block)
-                
-                if blocks_to_insert:
-                    for block in blocks_to_insert:
-                        session.add(block)
-                    session.commit()
-                    _logger.debug(f'Added {len(blocks_to_insert)} new blocks to database. '
-                                f'Timestamp: {blocks_to_insert[-1].timestamp}')
-                else:
-                    _logger.debug('No new blocks to add to database.')
-                
+
+            # Only add blocks that don't exist
+            for block in self.blocks_to_add:
+                if block.hash not in existing_hashes:
+                    blocks_to_insert.append(block)
+
+            if not blocks_to_insert:
+                _logger.debug('No new blocks to add to database.')
+                # nothing to do; keep queue clear
                 self.blocks_to_add = []
-            except IntegrityError as e:
-                session.rollback()
-                _logger.error(f'Error adding group of blocks: {e}')
-                raise
-            except Exception as e:
-                session.rollback()
-                _logger.error(f'Unexpected error committing blocks: {e}')
-                raise
+                return
+
+            failed_blocks = []
+            last_inserted_ts = None
+            inserted_count = 0
+
+            # Insert in chunks to avoid giant executemany statements
+            for i in range(0, len(blocks_to_insert), BLOCK_COMMIT_BATCH):
+                chunk = blocks_to_insert[i:i + BLOCK_COMMIT_BATCH]
+                chunk_range = f"{i+1}-{i+len(chunk)}"
+                success = False
+
+                # Try chunk commit with one retry
+                for attempt in range(2):
+                    try:
+                        with session_maker() as s:
+                            s.add_all(chunk)
+                            s.flush()
+                            s.commit()
+                        success = True
+                        inserted_count += len(chunk)
+                        last_inserted_ts = chunk[-1].timestamp
+                        _logger.debug(f'Committed block chunk {chunk_range} ({len(chunk)} blocks)')
+                        break
+                    except IntegrityError as e:
+                        # Possible race/duplicate insert; fallback to per-block
+                        _logger.warning(f'IntegrityError committing block chunk {chunk_range}: {e}. Falling back to per-block insert.')
+                        break
+                    except Exception as e:
+                        _logger.warning(f'Transient DB error committing block chunk {chunk_range}: {e}. Retrying once.')
+                        if attempt == 0:
+                            await asyncio.sleep(0.5)
+                            continue
+                        else:
+                            _logger.error(f'Failed committing chunk {chunk_range} after retry: {e}')
+                            break
+
+                # If chunk-level commit failed, try per-block inserts to isolate bad rows
+                if not success:
+                    for block in chunk:
+                        try:
+                            with session_maker() as s2:
+                                s2.add(block)
+                                s2.commit()
+                            inserted_count += 1
+                            last_inserted_ts = block.timestamp
+                        except IntegrityError:
+                            # Likely inserted concurrently by another worker; ignore
+                            _logger.debug(f'Block {block.hash} already exists (IntegrityError); skipping.')
+                        except Exception as e2:
+                            _logger.error(f'Failed inserting block {block.hash}: {e2}')
+                            failed_blocks.append(block)
+
+            if inserted_count > 0:
+                _logger.info(f'Added {inserted_count} new blocks to database. Timestamp: {last_inserted_ts}')
+            if failed_blocks:
+                _logger.error(f'Failed to insert {len(failed_blocks)} blocks; keeping them queued for retry')
+
+            # Keep failed blocks in the queue for next attempt
+            self.blocks_to_add = failed_blocks
+
+        except Exception as e:
+            _logger.error(f'Unexpected error committing blocks: {e}')
+            raise
         
 
     def is_tx_id_in_queue(self, tx_id):
