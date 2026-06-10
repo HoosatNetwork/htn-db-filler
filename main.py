@@ -102,17 +102,6 @@ async def main():
 
             if highest_block:
                 start_hash = highest_block.hash
-                start_block = {
-                    "header": {
-                        "hash": highest_block.hash,
-                        "timestamp": str(highest_block.timestamp * 1000),  
-                    },
-                    "verboseData": {
-                        "hash": highest_block.hash,
-                        "blueScore": highest_block.blue_score,
-                        # ... other fields as needed
-                    }
-                }
                 _logger.info(f"✅ Found highest block in DB: {start_hash} (blueScore={highest_block.blue_score})")
             else:
                 _logger.warning("No blocks found in database. Falling back to genesis/nearest virtual parent.")
