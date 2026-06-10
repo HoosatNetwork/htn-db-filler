@@ -88,48 +88,39 @@ async def main():
             start_block = resp["getBlockResponse"].get("block", [])
 
     if find_start_block:
-        _logger.info("Finding start block...")
-        low_hash = start_hash
-        found = False
-        headers_processed = 0
-        used_low_hashes = []
-        while found == False:
-            resp = await client.request("getBlocksRequest",
-                                             params={
-                                                 "lowHash": low_hash,
-                                                 "includeBlocks": True,
-                                                 "includeTransactions": False
-                                             },
-                                             timeout=60)
-            # go through each block and yield
-            if resp is not None:
-                block_hashes = resp["getBlocksResponse"].get("blockHashes", [])
-                blocks = resp["getBlocksResponse"].get("blocks", [])
-                _logger.info(f"Current low hash: {low_hash}, found {len(blocks)} blocks.")
-                for i in range(len(blocks)):
-                    block = blocks[i]
-                    block_hash = block_hashes[i]
-                    isHeaderOnly = block["verboseData"].get('isHeaderOnly')
-                    _logger.info(f"Block hash: {block_hash}, isHeaderOnly: {isHeaderOnly}")
-                    if isHeaderOnly != True:
-                        found = True
-                        start_block = block
-                        start_hash = block_hash
-                        _logger.info(f"Found start block: {start_hash}")
-                headers_processed += len(blocks)
-                _logger.info(f'Processed {headers_processed} headers so far.')
-                used_low_hashes.append(low_hash)
-                for i, block in reversed(list(enumerate(blocks))):
-                    _logger.info(f"Checking next possible low hash {block['verboseData']['hash']}")
-                    if block['verboseData']['hash'] != low_hash:
-                        hash_used = False
-                        for used_low_hash in used_low_hashes:
-                            if used_low_hash == block['verboseData']['hash']:
-                                hash_used = True
-                        if hash_used == False:
-                            low_hash = block['verboseData']['hash']
-                            break
-        used_low_hashes = []
+        _logger.info("Finding start block from database (highest processed block)...")
+        
+        from dbsession import session_maker
+        from models.Block import Block  
+
+        with session_maker() as session:
+            # Get the block with the highest blue score / timestamp / height
+            highest_block = session.query(Block).order_by(
+                Block.blue_score.desc(),   
+                Block.timestamp.desc()     
+            ).first()
+
+            if highest_block:
+                start_hash = highest_block.hash
+                start_block = {
+                    "header": {
+                        "hash": highest_block.hash,
+                        "timestamp": str(highest_block.timestamp * 1000),  
+                    },
+                    "verboseData": {
+                        "hash": highest_block.hash,
+                        "blueScore": highest_block.blue_score,
+                        # ... other fields as needed
+                    }
+                }
+                _logger.info(f"✅ Found highest block in DB: {start_hash} (blueScore={highest_block.blue_score})")
+            else:
+                _logger.warning("No blocks found in database. Falling back to genesis/nearest virtual parent.")
+                # fallback to original logic
+                daginfo = await client.request("getBlockDagInfoRequest", {})
+                if daginfo and "getBlockDagInfoResponse" in daginfo:
+                    virtualParentHash = daginfo["getBlockDagInfoResponse"]["virtualParentHashes"][0]
+                    start_hash = virtualParentHash
 
     batch_processing_str = os.getenv('BATCH_PROCESSING', 'False')  # Default to 'False' if not set
     batch_processing = batch_processing_str.lower() in ['true', '1', 't', 'y', 'yes']
