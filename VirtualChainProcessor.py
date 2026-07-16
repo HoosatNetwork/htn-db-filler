@@ -29,8 +29,14 @@ class VirtualChainProcessor(object):
         self.start_block = start_block
 
     async def set_start_block(self, block, block_hash):
-        self.start_block = block
-        self.start_hash = block_hash
+        """Safely set the start block. Only accepts dicts."""
+        if isinstance(block, dict):
+            self.start_block = block
+            self.start_hash = block_hash
+            _logger.debug(f"VCP start_block set to block {block_hash[:8]}...")
+        else:
+            _logger.warning(f"Ignoring bad start_block type: {type(block)}. Expected dict. "
+                            f"block_hash={block_hash[:8] if block_hash else None}")
 
     async def __update_transactions_in_db(self):
         """
@@ -124,32 +130,52 @@ class VirtualChainProcessor(object):
 
     async def yield_to_database(self):
         """
-        Add known blocks to database
+        Add known blocks to database.
+        Now safely handles the case where start_block might not be a proper dict.
         """
-        if self.start_block is not None and self.start_block["verboseData"].get("isHeaderOnly") != True:
+        # === DEFENSIVE CHECK ===
+        if self.start_block is None:
+            _logger.debug("VCP: start_block is None, skipping yield_to_database this round.")
+            return
+
+        if not isinstance(self.start_block, dict):
+            _logger.error(f"VCP BUG: start_block has wrong type {type(self.start_block)} "
+                        f"(expected dict). This usually means it was passed incorrectly "
+                        f"at construction time. Value (first 200 chars): {str(self.start_block)[:200]}")
+            return
+
+        # Original logic, now safe
+        if self.start_block.get("verboseData", {}).get("isHeaderOnly") != True:
             _logger.info(f'VCP requested with start hash {self.start_hash}')
-            resp = await self.client.request("getVirtualSelectedParentChainFromBlockRequest",
-                                            {"startHash": self.start_hash,
-                                            "includeAcceptedTransactionIds": True},
-                                            timeout=30)
-            # if there is a response, add to queue and set new startpoint
-            error = resp["getVirtualSelectedParentChainFromBlockResponse"].get("error", None)
+            resp = await self.client.request(
+                "getVirtualSelectedParentChainFromBlockRequest",
+                {"startHash": self.start_hash, "includeAcceptedTransactionIds": True},
+                timeout=30
+            )
+
+            if resp is None:
+                _logger.warning("VCP: empty response from getVirtualSelectedParentChainFromBlockRequest")
+                return
+
+            vcp_resp = resp.get("getVirtualSelectedParentChainFromBlockResponse", {})
+            error = vcp_resp.get("error", None)
+
             if error is None:
                 _logger.info(f'Got VCP response with: '
-                            f'{len(resp["getVirtualSelectedParentChainFromBlockResponse"].get("acceptedTransactionIds", []))}'
-                            f' acceptedTransactionIds, '
-                            f'{len(resp["getVirtualSelectedParentChainFromBlockResponse"].get("addedChainBlockHashes", []))}'
-                            f' addedChainBlockHashes, '
-                            f'{len(resp["getVirtualSelectedParentChainFromBlockResponse"].get("removedChainBlockHashes", []))}'
-                            f' removedChainBlockHashes')
-                self.virtual_chain_response = resp["getVirtualSelectedParentChainFromBlockResponse"]
+                            f'{len(vcp_resp.get("acceptedTransactionIds", []))} acceptedTransactionIds, '
+                            f'{len(vcp_resp.get("addedChainBlockHashes", []))} addedChainBlockHashes, '
+                            f'{len(vcp_resp.get("removedChainBlockHashes", []))} removedChainBlockHashes')
+
+                self.virtual_chain_response = vcp_resp
                 if self.virtual_chain_response is not None:
                     await self.__update_transactions_in_db()
             else:
                 _logger.debug('getVirtualSelectedParentChain error response:')
-                _logger.info(error["message"])
+                _logger.info(error.get("message", error))
                 self.virtual_chain_response = None
                 await asyncio.sleep(10)
+        else:
+            _logger.debug("VCP: start_block is header-only, skipping this round.")
 
     # async def yield_to_database(self, max_retries=5000000):
     #     """

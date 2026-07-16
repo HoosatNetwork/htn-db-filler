@@ -113,13 +113,14 @@ class BlocksProcessor(object):
         
 
     async def handle_blocks_committed(self):
-        """
-        this function is executed, when a new cluster of blocks were added to the database
-        """
         global task_runner
-        while task_runner and not task_runner.done():
+        if task_runner and not task_runner.done():
             return
         task_runner = asyncio.create_task(self.vcp.yield_to_database())
+        # Optional: add done callback to log exceptions
+        task_runner.add_done_callback(
+            lambda t: t.exception() and _logger.error(f"VCP task failed: {t.exception()}")
+        )
 
     async def blockiter(self, start_point):
         low_hash = start_point
