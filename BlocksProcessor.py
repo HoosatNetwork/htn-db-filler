@@ -21,7 +21,7 @@ _logger = logging.getLogger(__name__)
 # CLUSTER_SIZE = 4
 # CLUSTER_WAIT_SECONDS = 1
 
-# For 1 BPS
+# For 1 BPS - increased for better throughput
 CLUSTER_SIZE = 5
 CATCH_UP_CLUSTER_SIZE = 500
 CLUSTER_WAIT_SECONDS = 1
@@ -32,8 +32,10 @@ B_TREE_SIZE = 2500
 BLOCK_COMMIT_BATCH = int(os.getenv("BLOCK_COMMIT_BATCH", "100"))
 
 # DB timeouts for best-effort mapping inserts (milliseconds)
-LOCK_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_LOCK_TIMEOUT_MS", "200"))
-STATEMENT_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_STATEMENT_TIMEOUT_MS", "5000"))
+LOCK_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_LOCK_TIMEOUT_MS", "100"))
+STATEMENT_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_STATEMENT_TIMEOUT_MS", "60000"))
+
+BATCH_SIZE = int(os.getenv("TX_BATCH_SIZE", "100"))
 
 task_runner = None
 
@@ -87,6 +89,7 @@ class BlocksProcessor(object):
                 if self.env_enable_balance != False:
                     # Enqueue for background balance worker; do not block block processing
                     self.commit_balances(self.addresses_to_update)
+                    self.addresses_to_update = []  # Clear addresses to prevent memory buildup
                     
 
     def commit_balances(self, addresses):
@@ -189,7 +192,7 @@ class BlocksProcessor(object):
                         _logger.warning(f"Last returned block is old ({last_time}). Keeping current low_hash.")
                 else:
                     _logger.info("No progress. Waiting...")
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(0.5)
 
             _logger.info(f'New low hash: {low_hash[:8]}... (last block time: {self.last_block_time})')
 
@@ -262,209 +265,197 @@ class BlocksProcessor(object):
                         self.txs[tx_id].block_hash = list(set(self.txs[tx_id].block_hash + [block_hash]))
 
     async def batch_commit_txs(self):
+        """Batch commit with proper handling for transactions that already exist in DB.
+
+        If a tx already exists, we merge the new block_hash(es) into its array
+        instead of attempting an INSERT (which would violate the PK).
         """
-        Add all queued transactions and their in- and outputs to the database in batches
-        to avoid exceeding PostgreSQL limits.
-        """
-        BATCH_SIZE = int(os.getenv("TX_BATCH_SIZE", "50"))  # Define a suitable batch size (configurable via TX_BATCH_SIZE)
+        if not self.txs:
+            self.txs = {}
+            self.txs_output = []
+            self.txs_input = []
+            return
 
-        # First, handle updates for existing transactions.
-        tx_ids_to_add = list(self.txs.keys())
+        tx_ids = list(self.txs.keys())
+        _logger.info(f'Committing {len(tx_ids)} transactions (outputs={len(self.txs_output)}, inputs={len(self.txs_input)})')
 
-        # Calculate the number of batches needed for updating existing transactions
-        num_batches = len(tx_ids_to_add) // BATCH_SIZE + (1 if len(tx_ids_to_add) % BATCH_SIZE > 0 else 0)
+        all_tx_ids_to_map = []
 
-        # Handle updates for existing transactions in batches
-        for i in range(num_batches):
-            # Determine the subset of transaction IDs for this batch
-            batch_tx_ids = tx_ids_to_add[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
-
-            if not batch_tx_ids:
-                continue
-
-            # Try once, and retry one time if we hit a transient "aborted transaction"/connection state.
-            for attempt in range(2):
-                session = session_maker()
-                try:
-                    # Query only the transactions in the current batch
-                    tx_items = session.query(Transaction).filter(Transaction.transaction_id.in_(batch_tx_ids)).all()
-
-                    for tx_item in tx_items:
-                        # Update block_hash by combining existing ones with new ones from self.txs
-                        if tx_item.transaction_id in self.txs:
-                            new_block_hashes = list(set(tx_item.block_hash) | set(self.txs[tx_item.transaction_id].block_hash))
-                            tx_item.block_hash = new_block_hashes
-                            # Remove the transaction from self.txs since it's now been processed
-                            self.txs.pop(tx_item.transaction_id)
-
-                    # Commit the updates for this batch
-                    session.commit()
-                    session.close()
-                    _logger.info(f'Committed {len(batch_tx_ids)} transactions in batch {i+1}-{min(i+BATCH_SIZE, len(tx_ids_to_add))}')
-                    break
-                except Exception as e:
-                    # Ensure the session/connection is cleaned up and not returned to pool in an aborted state
+        # ============================================================
+        # Pre-check which transactions already exist in the DB
+        # and merge block_hashes for them (prevents UniqueViolation).
+        # ============================================================
+        existing_tx_ids = set()
+        CHUNK = 500
+        if tx_ids:
+            for i in range(0, len(tx_ids), CHUNK):
+                chunk = tx_ids[i:i + CHUNK]
+                for attempt in range(2):
                     try:
-                        session.rollback()
-                    except Exception:
-                        pass
-                    try:
-                        session.close()
-                    except Exception:
-                        pass
-
-                    # If this looks like an aborted transaction state, dispose the engine
-                    try:
-                        msg = str(e) or repr(e)
-                        if 'InFailedSqlTransaction' in msg or 'current transaction is aborted' in msg:
-                            _logger.warning('Detected aborted DB transaction state; disposing engine pool to reset connections')
-                            try:
-                                engine.dispose()
-                            except Exception as de:
-                                _logger.error(f'Error disposing engine: {de}')
-                    except Exception:
-                        pass
-
-                    if attempt == 0:
-                        _logger.warning(f"Transient DB error during update of tx batch {i+1}/{num_batches}: {e}. Rolling back and retrying once.")
-                        await asyncio.sleep(0.5)
-                        continue
-                    else:
-                        _logger.error(f'Error updating transactions in batch {i+1}/{num_batches} after retry: {e}')
+                        with session_maker() as session:
+                            rows = session.query(Transaction.transaction_id).filter(
+                                Transaction.transaction_id.in_(chunk)
+                            ).all()
+                            for r in rows:
+                                existing_tx_ids.add(r[0])
                         break
-
-        # Pre-map outputs and inputs to their transaction IDs for new transactions
-        outputs_by_tx = {tx_id: [] for tx_id in self.txs.keys()}
-        for output in self.txs_output:
-            if output.transaction_id in outputs_by_tx:
-                outputs_by_tx[output.transaction_id].append(output)
-
-        inputs_by_tx = {tx_id: [] for tx_id in self.txs.keys()}
-        for input in self.txs_input:
-            if input.transaction_id in inputs_by_tx:
-                inputs_by_tx[input.transaction_id].append(input)
-
-        # Now, handle insertion of new transactions in batches.
-        all_new_txs = list(self.txs.values())
-
-        # Insert new transactions and their inputs/outputs in batches
-        for i in range(0, len(all_new_txs), BATCH_SIZE):
-            _logger.info(f'Batch committing transactions {i+1}-{min(i+BATCH_SIZE, len(all_new_txs))} of {len(all_new_txs)}')
-            with session_maker() as session:
-                batch_txs = all_new_txs[i:i + BATCH_SIZE]
-                batch_tx_ids = [tx.transaction_id for tx in batch_txs]
-
-                batch_outputs = [output for tx_id in batch_tx_ids for output in outputs_by_tx[tx_id]]
-                batch_inputs = [input for tx_id in batch_tx_ids for input in inputs_by_tx[tx_id]]
-
-                # Add all new transactions, outputs, and inputs to the session
-                session.add_all(batch_txs)
-                session.add_all(batch_outputs)
-                session.add_all(batch_inputs)
-
-                try:
-                    # Flush pending INSERTs so they are visible to the DB
-                    session.flush()
-
-                    # Commit the main TXs/outputs/inputs first. Mapping inserts are best-effort
-                    # and must not be allowed to abort this primary transaction. Run mapping
-                    # inserts in a separate session after commit so failures do not affect
-                    # the committed data.
-                    session.commit()
-                    _logger.info(f'Committed {len(batch_tx_ids)} new transactions in batch {i+1}-{min(i+BATCH_SIZE, len(all_new_txs))}')
-
-                    # Attempt mapping inserts in a separate session (non-fatal)
-                    if batch_tx_ids:
+                    except Exception as e:
                         try:
-                            with session_maker() as map_sess:
+                            session.rollback()
+                        except Exception:
+                            pass
+                        # Handle aborted transaction state (copied from commit_txs)
+                        try:
+                            msg = str(e) or repr(e)
+                            if 'InFailedSqlTransaction' in msg or 'current transaction is aborted' in msg:
+                                _logger.warning('Detected aborted DB transaction state during tx existence check; disposing engine pool')
+                                try:
+                                    engine.dispose()
+                                except Exception as de:
+                                    _logger.error(f'Error disposing engine: {de}')
+                        except Exception:
+                            pass
 
-                                def _execute_mapping_with_retries_map(sess, stmt, params):
-                                    txs_param = params.get('tx_ids') if isinstance(params, dict) else []
-                                    _logger.debug(f'Attempting mapping insert (separate session) for {len(txs_param)} txs')
-                                    try:
-                                        with sess.begin():
-                                            try:
-                                                sess.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"))
-                                                sess.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT_MS}ms'"))
-                                            except Exception:
-                                                _logger.debug('Could not set local DB timeouts for mapping insert (batch)')
-                                            sess.execute(stmt, params)
-                                        _logger.debug('Mapping insert succeeded (separate session)')
-                                        return True
-                                    except OperationalError as e:
-                                        _logger.warning(f"Mapping insert skipped due to DB lock/timeout: {e}")
-                                        # Retry once with an extended timeout
-                                        extended = max(STATEMENT_TIMEOUT_MS * 6, 30000)
-                                        try:
-                                            with sess.begin():
-                                                try:
-                                                    sess.execute(text(f"SET LOCAL statement_timeout = '{extended}ms'"))
-                                                except Exception:
-                                                    pass
-                                                sess.execute(stmt, params)
-                                            _logger.debug('Mapping insert retry succeeded (separate session)')
-                                            return True
-                                        except OperationalError as e2:
-                                            _logger.warning(f"Mapping insert retry failed (separate session): {e2}")
-                                            # Fallback: try inserting per-tx id to reduce locking/scan cost
-                                            for tx in txs_param:
-                                                try:
-                                                    with sess.begin():
-                                                        try:
-                                                            sess.execute(text(f"SET LOCAL statement_timeout = '{extended}ms'"))
-                                                        except Exception:
-                                                            pass
-                                                        sess.execute(stmt, {"tx_ids": [tx]})
-                                                    _logger.debug(f'Per-tx mapping insert succeeded for {tx} (separate session)')
-                                                except Exception as e3:
-                                                    _logger.debug(f"Per-tx mapping insert failed for {tx}: {e3}")
-                                            return False
-                                    except Exception as e:
-                                        _logger.warning(f"Mapping insert failed (non-fatal, separate session): {e}")
-                                        return False
+                        _logger.warning(f"Transient DB error checking existing txs chunk {i}/{len(tx_ids)}: {e}. Retrying once.")
+                        if attempt == 0:
+                            await asyncio.sleep(0.25)
+                            continue
+                        else:
+                            _logger.error(f"Failed checking existing txs after retry: {e}")
+                            break
 
-                                stmt_out = text("""
-                                    INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
-                                    SELECT transactions_outputs.transaction_id, transactions_outputs.script_public_key_address, transactions.block_time
-                                    FROM transactions_outputs
-                                    JOIN transactions ON transactions.transaction_id = transactions_outputs.transaction_id
-                                    WHERE transactions_outputs.transaction_id IN :tx_ids
-                                      AND transactions_outputs.script_public_key_address IS NOT NULL
-                                    ON CONFLICT DO NOTHING
-                                """
-                                ).bindparams(bindparam("tx_ids", expanding=True))
+        # Update existing transactions' block_hash arrays (in small chunks)
+        if existing_tx_ids:
+            existing_list = list(existing_tx_ids)
+            UPDATE_CHUNK = 100
+            updated_count = 0
+            for i in range(0, len(existing_list), UPDATE_CHUNK):
+                chunk = existing_list[i:i + UPDATE_CHUNK]
+                for attempt in range(2):
+                    try:
+                        with session_maker() as session:
+                            tx_items = session.query(Transaction).filter(
+                                Transaction.transaction_id.in_(chunk)
+                            ).all()
+                            for tx_item in tx_items:
+                                if tx_item.transaction_id in self.txs:
+                                    new_hashes = self.txs[tx_item.transaction_id].block_hash or []
+                                    current_hashes = tx_item.block_hash or []
+                                    tx_item.block_hash = list(set(current_hashes) | set(new_hashes))
+                                    self.txs.pop(tx_item.transaction_id, None)
+                                    updated_count += 1
+                            session.commit()
+                        break
+                    except Exception as e:
+                        try:
+                            session.rollback()
+                        except Exception:
+                            pass
+                        _logger.warning(f"Error updating existing tx block_hashes chunk: {e}")
+                        if attempt == 0:
+                            await asyncio.sleep(0.25)
+                            continue
+                        else:
+                            _logger.error(f"Failed updating existing txs after retry: {e}")
+                            break
 
-                                success_out = _execute_mapping_with_retries_map(map_sess, stmt_out, {"tx_ids": batch_tx_ids})
-                                _logger.info(f'Outputs mapping insert success={success_out} for {len(batch_tx_ids)} txs')
+            if updated_count:
+                _logger.info(f"Updated block_hash array for {updated_count} existing transactions (no insert needed)")
 
-                                stmt_in = text("""
-                                    INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
-                                    SELECT transactions_inputs.transaction_id, transactions_outputs.script_public_key_address, transactions.block_time
-                                    FROM transactions_inputs
-                                    LEFT JOIN transactions_outputs ON transactions_outputs.transaction_id = transactions_inputs.previous_outpoint_hash
-                                        AND transactions_outputs.index = transactions_inputs.previous_outpoint_index
-                                    LEFT JOIN transactions ON transactions.transaction_id = transactions_inputs.transaction_id
-                                    WHERE transactions_inputs.transaction_id IN :tx_ids
-                                      AND transactions_outputs.script_public_key_address IS NOT NULL
-                                    ON CONFLICT DO NOTHING
-                                """
-                                ).bindparams(bindparam("tx_ids", expanding=True))
+        # Only NEW txs remain in self.txs now
+        remaining_tx_ids = list(self.txs.keys())
+        if not remaining_tx_ids:
+            _logger.info("No new transactions to insert (all were existing and had their block_hashes merged).")
+            self.txs = {}
+            self.txs_output = []
+            self.txs_input = []
+            return
 
-                                success_in = _execute_mapping_with_retries_map(map_sess, stmt_in, {"tx_ids": batch_tx_ids})
-                                _logger.info(f'Inputs mapping insert success={success_in} for {len(batch_tx_ids)} txs')
-                        except OperationalError as e:
-                            _logger.warning(f"Batch mapping insert skipped due to DB lock/timeout (separate session): {e}")
-                        except Exception as e:
-                            _logger.warning(f"Batch mapping insert failed (non-fatal, separate session): {e}")
+        # ============================================================
+        # Original batch insert logic — now only for NEW transactions
+        # ============================================================
+        for i in range(0, len(remaining_tx_ids), BATCH_SIZE):
+            batch_tx_ids = remaining_tx_ids[i:i + BATCH_SIZE]
+            batch_txs = [self.txs[tx_id] for tx_id in batch_tx_ids]
+
+            # Only outputs/inputs belonging to txs we are actually inserting
+            batch_outputs = [out for out in self.txs_output if out.transaction_id in batch_tx_ids]
+            batch_inputs = [inp for inp in self.txs_input if inp.transaction_id in batch_tx_ids]
+
+            with session_maker() as session:
+                try:
+                    session.add_all(batch_txs)
+                    session.add_all(batch_outputs)
+                    session.add_all(batch_inputs)
+
+                    session.flush()
+                    session.commit()
+
+                    _logger.info(f'Committed batch {i//BATCH_SIZE + 1} ({len(batch_tx_ids)} new txs)')
+                    all_tx_ids_to_map.extend(batch_tx_ids)
 
                 except Exception as e:
                     session.rollback()
-                    _logger.error(f'Error adding TXs to database in a batch {i+1}/{num_batches}: {e}')
+                    _logger.error(f'Error committing tx batch {i//BATCH_SIZE + 1}: {e}')
+                    # Rare race condition between our check and insert is possible.
+                    # We log and continue — the tx will be retried in a future cluster.
 
-        # Reset queues after all batches have been processed.
+        # Mapping (only for newly inserted txs)
+        if all_tx_ids_to_map:
+            await self._process_mapping_inserts_optimized(all_tx_ids_to_map)
+
+        # Clear queues
         self.txs = {}
-        self.txs_input = []
         self.txs_output = []
+        self.txs_input = []
+
+    async def _process_mapping_inserts_optimized(self, all_tx_ids):
+        """Split mapping into simpler, faster operations."""
+        if not all_tx_ids:
+            return
+
+        BATCH_SIZE = 60   # Even smaller for the heavy inputs part
+
+        try:
+            for i in range(0, len(all_tx_ids), BATCH_SIZE):
+                batch = all_tx_ids[i:i + BATCH_SIZE]
+                batch_num = i // BATCH_SIZE + 1
+
+                with session_maker() as sess:
+                    sess.execute(text("SET LOCAL statement_timeout = '90s'"))
+                    sess.execute(text("SET LOCAL lock_timeout = '20s'"))
+
+                    # 1. Simple outputs mapping (fast)
+                    sess.execute(text("""
+                        INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
+                        SELECT o.transaction_id, o.script_public_key_address, t.block_time
+                        FROM transactions_outputs o
+                        JOIN transactions t ON t.transaction_id = o.transaction_id
+                        WHERE o.transaction_id = ANY(:tx_ids)
+                        AND o.script_public_key_address IS NOT NULL
+                        ON CONFLICT DO NOTHING
+                    """), {"tx_ids": batch})
+
+                    # 2. Inputs mapping - split into two steps to reduce complexity
+                    # First get previous outputs
+                    sess.execute(text("""
+                        INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
+                        SELECT i.transaction_id, o.script_public_key_address, t.block_time
+                        FROM transactions_inputs i
+                        JOIN transactions_outputs o 
+                            ON o.transaction_id = i.previous_outpoint_hash 
+                        AND o.index = i.previous_outpoint_index
+                        JOIN transactions t ON t.transaction_id = i.transaction_id
+                        WHERE i.transaction_id = ANY(:tx_ids)
+                        AND o.script_public_key_address IS NOT NULL
+                        ON CONFLICT DO NOTHING
+                    """), {"tx_ids": batch})
+
+                    sess.commit()
+                    _logger.info(f"Mapping batch {batch_num} completed ({len(batch)} txs)")
+
+        except Exception as e:
+            _logger.warning(f"Mapping batch failed (non-fatal): {e}")
 
     # Original commit_txs
     async def commit_txs(self):
@@ -543,91 +534,12 @@ class BlocksProcessor(object):
                 # the committed data.
                 session.commit()
 
-                # Attempt mapping inserts in a separate session (non-fatal)
+                # Attempt mapping inserts using the optimized method
                 if tx_ids_to_add:
-                    try:
-                        with session_maker() as map_sess:
-
-                            def _execute_mapping_with_retries_map(sess, stmt, params):
-                                txs_param = params.get('tx_ids') if isinstance(params, dict) else []
-                                _logger.debug(f'Attempting mapping insert (separate session) for {len(txs_param)} txs')
-                                try:
-                                    with sess.begin():
-                                        try:
-                                            sess.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT_MS}ms'"))
-                                            sess.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT_MS}ms'"))
-                                        except Exception:
-                                            _logger.debug('Could not set local DB timeouts for mapping insert')
-                                        sess.execute(stmt, params)
-                                    _logger.debug('Mapping insert succeeded (separate session)')
-                                    return True
-                                except OperationalError as e:
-                                    _logger.warning(f"Mapping insert skipped due to DB lock/timeout: {e}")
-                                    # Retry once with an extended timeout
-                                    extended = max(STATEMENT_TIMEOUT_MS * 6, 30000)
-                                    try:
-                                        with sess.begin():
-                                            try:
-                                                sess.execute(text(f"SET LOCAL statement_timeout = '{extended}ms'"))
-                                            except Exception:
-                                                pass
-                                            sess.execute(stmt, params)
-                                        _logger.debug('Mapping insert retry succeeded (separate session)')
-                                        return True
-                                    except OperationalError as e2:
-                                        _logger.warning(f"Mapping insert retry failed (separate session): {e2}")
-                                        # Fallback: try inserting per-tx id to reduce locking/scan cost
-                                        for tx in txs_param:
-                                            try:
-                                                with sess.begin():
-                                                    try:
-                                                        sess.execute(text(f"SET LOCAL statement_timeout = '{extended}ms'"))
-                                                    except Exception:
-                                                        pass
-                                                    sess.execute(stmt, {"tx_ids": [tx]})
-                                                _logger.debug(f'Per-tx mapping insert succeeded for {tx} (separate session)')
-                                            except Exception as e3:
-                                                _logger.debug(f"Per-tx mapping insert failed for {tx}: {e3}")
-                                        return False
-                                except Exception as e:
-                                    _logger.warning(f"Mapping insert failed (non-fatal, separate session): {e}")
-                                    return False
-
-                            # outputs -> mapping
-                            stmt_out = text("""
-                                INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
-                                SELECT transactions_outputs.transaction_id, transactions_outputs.script_public_key_address, transactions.block_time
-                                FROM transactions_outputs
-                                JOIN transactions ON transactions.transaction_id = transactions_outputs.transaction_id
-                                WHERE transactions_outputs.transaction_id IN :tx_ids
-                                  AND transactions_outputs.script_public_key_address IS NOT NULL
-                                ON CONFLICT DO NOTHING
-                            """
-                            ).bindparams(bindparam("tx_ids", expanding=True))
-
-                            success_out = _execute_mapping_with_retries_map(map_sess, stmt_out, {"tx_ids": tx_ids_to_add})
-                            _logger.info(f'Outputs mapping insert success={success_out} for {len(tx_ids_to_add)} txs')
-
-                            # inputs -> mapping (map spending tx to address of previous outpoint)
-                            stmt_in = text("""
-                                INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
-                                SELECT transactions_inputs.transaction_id, transactions_outputs.script_public_key_address, transactions.block_time
-                                FROM transactions_inputs
-                                LEFT JOIN transactions_outputs ON transactions_outputs.transaction_id = transactions_inputs.previous_outpoint_hash
-                                    AND transactions_outputs.index = transactions_inputs.previous_outpoint_index
-                                LEFT JOIN transactions ON transactions.transaction_id = transactions_inputs.transaction_id
-                                WHERE transactions_inputs.transaction_id IN :tx_ids
-                                    AND transactions_outputs.script_public_key_address IS NOT NULL
-                                ON CONFLICT DO NOTHING
-                            """
-                            ).bindparams(bindparam("tx_ids", expanding=True))
-
-                            success_in = _execute_mapping_with_retries_map(map_sess, stmt_in, {"tx_ids": tx_ids_to_add})
-                            _logger.info(f'Inputs mapping insert success={success_in} for {len(tx_ids_to_add)} txs')
-                    except OperationalError as e:
-                        _logger.warning(f"Mapping insert skipped due to DB lock/timeout (separate session): {e}")
-                    except Exception as e:
-                        _logger.warning(f"Mapping insert failed (non-fatal, separate session): {e}")
+                    # Get the remaining transaction IDs that need mapping
+                    remaining_tx_ids = [tx_id for tx_id in tx_ids_to_add if tx_id in self.txs]
+                    if remaining_tx_ids:
+                        await self._process_mapping_inserts_optimized(remaining_tx_ids)
 
                 # Reset queues
                 self.txs = {}

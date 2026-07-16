@@ -497,7 +497,7 @@ class BalanceProcessor(object):
                         queued_total += len(to_process)
                         chunk.clear()
                         await self.update_balance_from_rpc(to_process, 10)
-                        await asyncio.sleep(0)
+                        await asyncio.sleep(0.5)
 
                     now = time.time()
                     if now - last_log_ts >= log_every_seconds:
