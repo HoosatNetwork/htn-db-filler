@@ -73,7 +73,7 @@ class BlocksProcessor(object):
             await self.__add_block_to_queue(block_hash, block)
             await self.__add_tx_to_queue(block_hash, block)
             if block["verboseData"].get("isHeaderOnly") != True and self.start_hash_set == False: 
-                await self.vcp.set_start_block(block, block_hash)
+                await self.vcp.set_start_block(block_hash)
                 self.start_hash_set = True
             # if cluster size is reached, insert to database
             cluster_size = CATCH_UP_CLUSTER_SIZE if not self.synced else CLUSTER_SIZE

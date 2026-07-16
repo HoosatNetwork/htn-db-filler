@@ -22,21 +22,50 @@ class VirtualChainProcessor(object):
     basically a temporary storage. This buffer should be processed AFTER the blocks and transactions are added.
     """
 
-    def __init__(self, client, start_block, start_hash):
+    def __init__(self, client, start_hash, start_block=None):
+        """
+        start_hash: the string hash to start VCP from (preferred).
+        start_block: optional legacy dict (only used to extract hash if start_hash is None).
+        """
         self.virtual_chain_response = None
-        self.start_hash = start_hash
         self.client = client
-        self.start_block = start_block
 
-    async def set_start_block(self, block, block_hash):
-        """Safely set the start block. Only accepts dicts."""
-        if isinstance(block, dict):
-            self.start_block = block
-            self.start_hash = block_hash
-            _logger.debug(f"VCP start_block set to block {block_hash[:8]}...")
+        # Prefer explicit start_hash (string). Fall back to extracting from legacy start_block dict.
+        if start_hash:
+            self.start_hash = start_hash
+        elif isinstance(start_block, dict):
+            # legacy path: try to get hash from the block dict
+            self.start_hash = start_block.get("verboseData", {}).get("hash") or start_block.get("hash")
+            _logger.debug(f"VCP using legacy start_block dict to set start_hash={self.start_hash}")
         else:
-            _logger.warning(f"Ignoring bad start_block type: {type(block)}. Expected dict. "
+            self.start_hash = None
+            if start_block is not None:
+                _logger.warning(f"VCP __init__: start_block param was not a dict and no start_hash given. "
+                                f"Got type {type(start_block)}. start_hash remains None until set.")
+
+    async def set_start_block(self, block_or_hash, block_hash=None):
+        """
+        Set the starting point for VCP.
+        Accepts either:
+          - a full block dict (legacy) + optional block_hash
+          - or just the block_hash string (preferred, as start_block should be string)
+        """
+        if isinstance(block_or_hash, dict):
+            # legacy dict path
+            self.start_hash = block_hash or block_or_hash.get("verboseData", {}).get("hash") \
+                              or block_or_hash.get("hash")
+            _logger.debug(f"VCP start_hash set from block dict to {self.start_hash[:8] if self.start_hash else None}...")
+        elif isinstance(block_or_hash, str):
+            self.start_hash = block_or_hash
+            _logger.debug(f"VCP start_hash set to {self.start_hash[:8]}...")
+        else:
+            _logger.warning(f"VCP set_start_block: unexpected type {type(block_or_hash)}. "
                             f"block_hash={block_hash[:8] if block_hash else None}")
+            return
+
+        # Clear any stale block dict reference (we no longer store the full dict)
+        if hasattr(self, 'start_block'):
+            self.start_block = None
 
     async def __update_transactions_in_db(self):
         """
@@ -130,126 +159,39 @@ class VirtualChainProcessor(object):
 
     async def yield_to_database(self):
         """
-        Add known blocks to database.
-        Now safely handles the case where start_block might not be a proper dict.
+        Perform VCP update using the current start_hash (string).
+        The start_block dict is no longer required (start_block should be / is treated as string hash).
+        We always attempt the request if we have a start_hash; header-only edge cases are handled by the node.
         """
-        # === DEFENSIVE CHECK ===
-        if self.start_block is None:
-            _logger.debug("VCP: start_block is None, skipping yield_to_database this round.")
+        if not self.start_hash:
+            _logger.debug("VCP: start_hash is None/empty, skipping yield_to_database this round.")
             return
 
-        if not isinstance(self.start_block, dict):
-            _logger.error(f"VCP BUG: start_block has wrong type {type(self.start_block)} "
-                        f"(expected dict). This usually means it was passed incorrectly "
-                        f"at construction time. Value (first 200 chars): {str(self.start_block)[:200]}")
+        _logger.info(f'VCP requested with start hash {self.start_hash}')
+        resp = await self.client.request(
+            "getVirtualSelectedParentChainFromBlockRequest",
+            {"startHash": self.start_hash, "includeAcceptedTransactionIds": True},
+            timeout=30
+        )
+
+        if resp is None:
+            _logger.warning("VCP: empty response from getVirtualSelectedParentChainFromBlockRequest")
             return
 
-        # Original logic, now safe
-        if self.start_block.get("verboseData", {}).get("isHeaderOnly") != True:
-            _logger.info(f'VCP requested with start hash {self.start_hash}')
-            resp = await self.client.request(
-                "getVirtualSelectedParentChainFromBlockRequest",
-                {"startHash": self.start_hash, "includeAcceptedTransactionIds": True},
-                timeout=30
-            )
+        vcp_resp = resp.get("getVirtualSelectedParentChainFromBlockResponse", {})
+        error = vcp_resp.get("error", None)
 
-            if resp is None:
-                _logger.warning("VCP: empty response from getVirtualSelectedParentChainFromBlockRequest")
-                return
+        if error is None:
+            _logger.info(f'Got VCP response with: '
+                        f'{len(vcp_resp.get("acceptedTransactionIds", []))} acceptedTransactionIds, '
+                        f'{len(vcp_resp.get("addedChainBlockHashes", []))} addedChainBlockHashes, '
+                        f'{len(vcp_resp.get("removedChainBlockHashes", []))} removedChainBlockHashes')
 
-            vcp_resp = resp.get("getVirtualSelectedParentChainFromBlockResponse", {})
-            error = vcp_resp.get("error", None)
-
-            if error is None:
-                _logger.info(f'Got VCP response with: '
-                            f'{len(vcp_resp.get("acceptedTransactionIds", []))} acceptedTransactionIds, '
-                            f'{len(vcp_resp.get("addedChainBlockHashes", []))} addedChainBlockHashes, '
-                            f'{len(vcp_resp.get("removedChainBlockHashes", []))} removedChainBlockHashes')
-
-                self.virtual_chain_response = vcp_resp
-                if self.virtual_chain_response is not None:
-                    await self.__update_transactions_in_db()
-            else:
-                _logger.debug('getVirtualSelectedParentChain error response:')
-                _logger.info(error.get("message", error))
-                self.virtual_chain_response = None
-                await asyncio.sleep(10)
+            self.virtual_chain_response = vcp_resp
+            if self.virtual_chain_response is not None:
+                await self.__update_transactions_in_db()
         else:
-            _logger.debug("VCP: start_block is header-only, skipping this round.")
-
-    # async def yield_to_database(self, max_retries=5000000):
-    #     """
-    #     Add known blocks to database by iteratively finding a valid start_hash.
-        
-    #     Args:
-    #         max_retries (int): Maximum number of retry attempts to find a valid start_hash.
-    #     """
-    #     _logger.info(f'VCP requested with start hash {self.start_hash}')
-    #     current_hash = self.start_hash
-    #     retries = 0
-
-    #     while retries < max_retries:
-    #         # Send getVirtualSelectedParentChainFromBlockRequest
-    #         resp = await self.client.request(
-    #             "getVirtualSelectedParentChainFromBlockRequest",
-    #             {"startHash": current_hash, "includeAcceptedTransactionIds": True},
-    #             timeout=240
-    #         )
-            
-    #         # Check for error in response
-    #         error = resp["getVirtualSelectedParentChainFromBlockResponse"].get("error", None)
-    #         if error is None:
-    #             # Success: Process the response
-    #             _logger.info(
-    #                 f'Got VCP response with: '
-    #                 f'{len(resp["getVirtualSelectedParentChainFromBlockResponse"].get("acceptedTransactionIds", []))} '
-    #                 f'acceptedTransactionIds, '
-    #                 f'{len(resp["getVirtualSelectedParentChainFromBlockResponse"].get("addedChainBlockHashes", []))} '
-    #                 f'addedChainBlockHashes, '
-    #                 f'{len(resp["getVirtualSelectedParentChainFromBlockResponse"].get("removedChainBlockHashes", []))} '
-    #                 f'removedChainBlockHashes'
-    #             )
-    #             self.virtual_chain_response = resp["getVirtualSelectedParentChainFromBlockResponse"]
-    #             self.start_hash = current_hash  # Update start_hash to the successful one
-    #             await self.__update_transactions_in_db()
-    #             return self.virtual_chain_response
-
-    #         # Error: Log and try to find a new start_hash
-    #         _logger.debug('getVirtualSelectedParentChain error response:')
-    #         _logger.info(error["message"])
-            
-    #         # Request blocks data starting from the current hash
-    #         resp = await self.client.request(
-    #             "getBlocksRequest",
-    #             params={
-    #                 "lowHash": current_hash,
-    #                 "includeTransactions": False,
-    #                 "includeBlocks": True
-    #             },
-    #             timeout=60
-    #         )
-            
-    #         block_hashes = resp["getBlocksResponse"].get("blockHashes", [])
-    #         _logger.info(f'Received {len(block_hashes)} blocks from getBlocksResponse')
-    #         blocks = resp["getBlocksResponse"].get("blocks", [])
-            
-    #         if not blocks:
-    #             _logger.warning(f"No blocks in getBlocksResponse for lowHash {current_hash}")
-    #             return []
-
-    #         # Get children hashes from the last block to skip forward
-    #         last_block = blocks[-1]
-    #         children = last_block.get("verboseData", {}).get("childrenHashes", [])
-    #         if not children:
-    #             _logger.warning(f"No children found for hash {last_block.get('hash')}")
-    #             return []
-
-    #         # Try the first child hash of the last block in the next iteration
-    #         current_hash = children[0]
-    #         retries += len(blocks)
-    #         _logger.info(f'Retrying with new start_hash {current_hash} (attempt {retries + 1}/{max_retries})')
-
-    #     # Exhausted retries or no children available
-    #     _logger.error(f"Failed to find a valid start_hash after {max_retries} retries")
-    #     self.virtual_chain_response = None
-    #     return []
+            _logger.debug('getVirtualSelectedParentChain error response:')
+            _logger.info(error.get("message", error))
+            self.virtual_chain_response = None
+            await asyncio.sleep(10)
