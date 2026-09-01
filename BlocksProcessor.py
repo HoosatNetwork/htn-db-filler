@@ -117,10 +117,22 @@ class BlocksProcessor(object):
         if task_runner and not task_runner.done():
             return
         task_runner = asyncio.create_task(self.vcp.yield_to_database())
-        # Optional: add done callback to log exceptions
-        task_runner.add_done_callback(
-            lambda t: t.exception() and _logger.error(f"VCP task failed: {t.exception()}")
-        )
+
+        def on_task_done(task):
+            if task.cancelled():
+                _logger.debug("VCP task was cancelled")
+                return
+
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                _logger.debug("VCP task was cancelled while collecting its result")
+                return
+
+            if exc is not None:
+                _logger.error(f"VCP task failed: {exc}")
+
+        task_runner.add_done_callback(on_task_done)
 
     async def blockiter(self, start_point):
         low_hash = start_point
@@ -157,11 +169,6 @@ class BlocksProcessor(object):
                 block_data = blocks[i]
                 block_time = int(block_data["header"]["timestamp"]) // 1000
 
-                # NEW: Strong time-based guard
-                if self.last_block_time > 0 and block_time < self.last_block_time - self.max_time_drift_seconds:
-                    _logger.warning(f"Block {blockHash[:8]}... has old timestamp ({block_time}). Skipping.")
-                    continue
-
                 if blockHash == tip_hash:
                     _logger.info('Found tip hash. Generator is synced now.')
                     self.synced = True
@@ -183,14 +190,11 @@ class BlocksProcessor(object):
                 await asyncio.sleep(CLUSTER_WAIT_SECONDS)
             else:
                 if advanced and block_hashes:
-                    # Only advance to the last *newer* block
+                    # Advance to the last block, regardless of age
                     last_hash = block_hashes[-1]
                     last_time = int(blocks[-1]["header"]["timestamp"]) // 1000
-                    if last_time >= self.last_block_time - 60:  # small tolerance
-                        low_hash = last_hash
-                        self.last_block_time = max(self.last_block_time, last_time)
-                    else:
-                        _logger.warning(f"Last returned block is old ({last_time}). Keeping current low_hash.")
+                    low_hash = last_hash
+                    self.last_block_time = max(self.last_block_time, last_time)
                 else:
                     _logger.info("No progress. Waiting...")
                     await asyncio.sleep(0.5)
