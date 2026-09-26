@@ -13,6 +13,9 @@ from models.Transaction import Transaction
 
 _logger = logging.getLogger(__name__)
 
+# How many recent DB blocks to probe on the node when the VCP start hash is unknown to it
+VCP_RECOVERY_MAX_CANDIDATES = int(os.getenv("VCP_RECOVERY_MAX_CANDIDATES", "50"))
+
 class VirtualChainProcessor(object):
     """
     VirtualChainProcessor polls the command getVirtualSelectedParentChainFromBlockRequest and updates transactions
@@ -192,6 +195,62 @@ class VirtualChainProcessor(object):
                 await self.__update_transactions_in_db()
         else:
             _logger.debug('getVirtualSelectedParentChain error response:')
-            _logger.info(error.get("message", error))
+            message = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+            _logger.info(message)
             self.virtual_chain_response = None
+            if "does not exist" in message or "not found" in message:
+                # The node doesn't know the start block (pruned, orphaned or from another node).
+                # Retrying with the same hash would never succeed, so pick a new start point.
+                await self.__recover_start_hash()
+            else:
+                await asyncio.sleep(10)
+
+    async def __block_exists_on_node(self, block_hash):
+        resp = await self.client.request("getBlockRequest",
+                                         {"hash": block_hash, "includeTransactions": False},
+                                         timeout=10)
+        if resp is None:
+            return False
+        block_resp = resp.get("getBlockResponse", {})
+        if block_resp.get("error") is not None:
+            return False
+        block = block_resp.get("block")
+        if not block:
+            return False
+        return block.get("verboseData", {}).get("isHeaderOnly") is not True
+
+    async def __recover_start_hash(self):
+        """
+        Find a start hash the node can build the virtual chain from.
+        Walks back through blocks in the database (from the failing block's blue score downwards),
+        falling back to the node's pruning point, then the virtual parent.
+        """
+        bad_hash = self.start_hash
+        new_hash = None
+
+        with session_maker() as s:
+            bad_score = s.query(Block.blue_score).filter(Block.hash == bad_hash).scalar()
+            q = s.query(Block.hash).filter(Block.hash != bad_hash)
+            if bad_score is not None:
+                q = q.filter(Block.blue_score <= bad_score)
+            candidates = [row[0] for row in q.order_by(Block.blue_score.desc())
+                          .limit(VCP_RECOVERY_MAX_CANDIDATES).all()]
+
+        for candidate in candidates:
+            if await self.__block_exists_on_node(candidate):
+                new_hash = candidate
+                break
+
+        if new_hash is None:
+            daginfo = await self.client.request("getBlockDagInfoRequest", {})
+            info = (daginfo or {}).get("getBlockDagInfoResponse", {})
+            new_hash = info.get("pruningPointHash") or (info.get("virtualParentHashes") or [None])[0]
+
+        if new_hash is None:
+            _logger.warning(f'VCP: could not find a replacement for start hash {bad_hash}. Retrying later.')
             await asyncio.sleep(10)
+            return
+
+        _logger.warning(f'VCP: start hash {bad_hash} not found on node. Switching to {new_hash}.')
+        self.start_hash = new_hash
+        KeyValueStore.set("vspc_last_start_hash", new_hash)

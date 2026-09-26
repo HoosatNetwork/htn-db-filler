@@ -142,7 +142,7 @@ async def main():
             await asyncio.sleep(refresh_every_seconds)
 
     # create instances of blocksprocessor and virtualchainprocessor
-    vcp = VirtualChainProcessor(client, start_block, start_hash)
+    vcp = VirtualChainProcessor(client, start_hash, start_block)
     bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
 
     # start blocks processor working concurrent
