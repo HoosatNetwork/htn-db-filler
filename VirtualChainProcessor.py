@@ -76,6 +76,45 @@ class VirtualChainProcessor(object):
         if hasattr(self, 'start_block'):
             self.start_block = None
 
+    @staticmethod
+    def _blocks_in_db(block_hashes, chunk_size=500):
+        in_db = set()
+        with session_maker() as s:
+            for i in range(0, len(block_hashes), chunk_size):
+                chunk = block_hashes[i:i + chunk_size]
+                rows = s.query(Block).filter(Block.hash.in_(chunk)).with_entities(Block.hash).all()
+                in_db.update(x[0] for x in rows)
+        return in_db
+
+    @staticmethod
+    def _reject_blocks(rejected_blocks, chunk_size=500):
+        # set is_accepted to False, when blocks were removed from virtual parent chain
+        total = 0
+        with session_maker() as s:
+            for i in range(0, len(rejected_blocks), chunk_size):
+                chunk = rejected_blocks[i:i + chunk_size]
+                # use synchronize_session=False for bulk update
+                total += s.query(Transaction).filter(Transaction.accepting_block_hash.in_(chunk)) \
+                    .update({'is_accepted': False, 'accepting_block_hash': None}, synchronize_session=False)
+            s.commit()
+        return total
+
+    @staticmethod
+    def _accept_batch(batch, new_start_hash, chunk_size=500):
+        count_tx = 0
+        with session_maker() as s:
+            for accepting_block_hash, accepted_tx_ids in batch:
+                if not accepted_tx_ids:
+                    continue
+                for i in range(0, len(accepted_tx_ids), chunk_size):
+                    chunk = accepted_tx_ids[i:i + chunk_size]
+                    count_tx += s.query(Transaction).filter(Transaction.transaction_id.in_(chunk)) \
+                        .update({'is_accepted': True, 'accepting_block_hash': accepting_block_hash},
+                                synchronize_session=False)
+            s.commit()
+        KeyValueStore.set("vspc_last_start_hash", new_start_hash)
+        return count_tx
+
     async def __update_transactions_in_db(self):
         """
         goes through one parentChainResponse and updates the is_accepted field in the database.
@@ -100,67 +139,42 @@ class VirtualChainProcessor(object):
                 _logger.info(f'VCP: chain in response runs from {parent_chain_blocks[0]} '
                              f'to {parent_chain_blocks[-1]} (start hash {self.start_hash})')
 
-                with session_maker() as s:
-                    parent_chain_blocks_in_db = set()
-                    CHUNK = 500
-                    if parent_chain_blocks:
-                        for i in range(0, len(parent_chain_blocks), CHUNK):
-                            chunk = parent_chain_blocks[i:i + CHUNK]
-                            rows = s.query(Block).filter(Block.hash.in_(chunk)).with_entities(Block.hash).all()
-                            parent_chain_blocks_in_db.update(x[0] for x in rows)
+                # DB work runs in a worker thread so it doesn't block the event loop (blocks processor, gRPC)
+                parent_chain_blocks_in_db = await asyncio.to_thread(self._blocks_in_db, parent_chain_blocks)
 
-                # go through all acceptedTransactionIds and skip blocks that are not in database
+                # go through all acceptedTransactionIds and stop at the first block not yet in database,
+                # so the start point never moves past chain blocks the blocks processor hasn't stored yet
                 for tx_accept_dict in parent_chain_response['acceptedTransactionIds']:
                     accepting_block_hash = tx_accept_dict['acceptingBlockHash']
 
                     if accepting_block_hash not in parent_chain_blocks_in_db:
-                        continue
+                        _logger.info(f'VCP: chain block {accepting_block_hash} not in database yet, '
+                                     f'stopping here')
+                        break
 
                     accepted_ids.append((accepting_block_hash, tx_accept_dict.get("acceptedTransactionIds", [])))
 
-                _logger.info(f'VCP: {len(accepted_ids)} of {len(parent_chain_blocks)} chain blocks are in database')
+                _logger.info(f'VCP: {len(accepted_ids)} of {len(parent_chain_blocks)} chain blocks are in database '
+                             f'({len(parent_chain_blocks_in_db)} in total incl. after first gap)')
 
                 # add rejected blocks if needed
                 rejected_blocks.extend(parent_chain_response.get('removedChainBlockHashes', []))
                 _logger.info(f'VCP: {len(rejected_blocks)} removedChainBlockHashes to process')
 
-                with session_maker() as s:
-                    # set is_accepted to False, when blocks were removed from virtual parent chain
-                    CHUNK = 500
-                    if rejected_blocks:
-                        total = 0
-                        for i in range(0, len(rejected_blocks), CHUNK):
-                            chunk = rejected_blocks[i:i + CHUNK]
-                            # use synchronize_session=False for bulk update
-                            c = s.query(Transaction).filter(Transaction.accepting_block_hash.in_(chunk)) \
-                                .update({'is_accepted': False, 'accepting_block_hash': None}, synchronize_session=False)
-                            total += c
-                        _logger.info(f'Set is_accepted=False for {total} TXs')
-                        s.commit()
+                if rejected_blocks:
+                    total = await asyncio.to_thread(self._reject_blocks, rejected_blocks)
+                    _logger.info(f'Set is_accepted=False for {total} TXs')
 
-                    # set is_accepted to True and add accepting_block_hash, committing and saving
-                    # the start point per batch so progress survives restarts
-                    for b in range(0, len(accepted_ids), VCP_BATCH_SIZE):
-                        batch = accepted_ids[b:b + VCP_BATCH_SIZE]
-                        count_tx = 0
-                        for accepting_block_hash, accepted_tx_ids in batch:
-                            if not accepted_tx_ids:
-                                continue
-                            for i in range(0, len(accepted_tx_ids), CHUNK):
-                                chunk = accepted_tx_ids[i:i + CHUNK]
-                                c = s.query(Transaction).filter(Transaction.transaction_id.in_(chunk)) \
-                                    .update({'is_accepted': True, 'accepting_block_hash': accepting_block_hash}, synchronize_session=False)
-                                count_tx += c
-                        s.commit()
-
-                        last_known_chain_block = batch[-1][0]
-                        KeyValueStore.set("vspc_last_start_hash", last_known_chain_block)
-                        self.start_hash = last_known_chain_block
-                        _logger.info(f'Set is_accepted=True for {count_tx} transactions '
-                                     f'({b + len(batch)}/{len(accepted_ids)} chain blocks). '
-                                     f'New start point {last_known_chain_block}')
-                        # let the blocks processor run between batches
-                        await asyncio.sleep(0)
+                # set is_accepted to True and add accepting_block_hash, committing and saving
+                # the start point per batch so progress survives restarts
+                for b in range(0, len(accepted_ids), VCP_BATCH_SIZE):
+                    batch = accepted_ids[b:b + VCP_BATCH_SIZE]
+                    last_known_chain_block = batch[-1][0]
+                    count_tx = await asyncio.to_thread(self._accept_batch, batch, last_known_chain_block)
+                    self.start_hash = last_known_chain_block
+                    _logger.info(f'Set is_accepted=True for {count_tx} transactions '
+                                 f'({b + len(batch)}/{len(accepted_ids)} chain blocks). '
+                                 f'New start point {last_known_chain_block}')
 
                 # Clear the current response
                 self.virtual_chain_response = None
