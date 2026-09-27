@@ -142,20 +142,17 @@ class VirtualChainProcessor(object):
                 # DB work runs in a worker thread so it doesn't block the event loop (blocks processor, gRPC)
                 parent_chain_blocks_in_db = await asyncio.to_thread(self._blocks_in_db, parent_chain_blocks)
 
-                # go through all acceptedTransactionIds and stop at the first block not yet in database,
-                # so the start point never moves past chain blocks the blocks processor hasn't stored yet
+                # go through all acceptedTransactionIds and skip blocks that are not in database
+                # (they are missing from the node, so they will never be stored)
                 for tx_accept_dict in parent_chain_response['acceptedTransactionIds']:
                     accepting_block_hash = tx_accept_dict['acceptingBlockHash']
 
                     if accepting_block_hash not in parent_chain_blocks_in_db:
-                        _logger.info(f'VCP: chain block {accepting_block_hash} not in database yet, '
-                                     f'stopping here')
-                        break
+                        continue
 
                     accepted_ids.append((accepting_block_hash, tx_accept_dict.get("acceptedTransactionIds", [])))
 
-                _logger.info(f'VCP: {len(accepted_ids)} of {len(parent_chain_blocks)} chain blocks are in database '
-                             f'({len(parent_chain_blocks_in_db)} in total incl. after first gap)')
+                _logger.info(f'VCP: {len(accepted_ids)} of {len(parent_chain_blocks)} chain blocks are in database')
 
                 # add rejected blocks if needed
                 rejected_blocks.extend(parent_chain_response.get('removedChainBlockHashes', []))
@@ -181,6 +178,9 @@ class VirtualChainProcessor(object):
 
                 if last_known_chain_block:
                     await asyncio.sleep(30)
+                else:
+                    # nothing to process yet; don't immediately re-request the same large chain
+                    await asyncio.sleep(VCP_RETRY_DELAY_SECONDS)
 
 
     async def yield_to_database(self):
