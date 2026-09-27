@@ -16,6 +16,10 @@ _logger = logging.getLogger(__name__)
 # How many recent DB blocks to probe on the node when the VCP start hash is unknown to it
 VCP_RECOVERY_MAX_CANDIDATES = int(os.getenv("VCP_RECOVERY_MAX_CANDIDATES", "50"))
 
+# The node returns the whole chain from start_hash to the tip, so an old start hash can take minutes
+VCP_TIMEOUT_SECONDS = float(os.getenv("VCP_TIMEOUT_SECONDS", "600"))
+VCP_RETRY_DELAY_SECONDS = float(os.getenv("VCP_RETRY_DELAY_SECONDS", "30"))
+
 class VirtualChainProcessor(object):
     """
     VirtualChainProcessor polls the command getVirtualSelectedParentChainFromBlockRequest and updates transactions
@@ -174,11 +178,13 @@ class VirtualChainProcessor(object):
         resp = await self.client.request(
             "getVirtualSelectedParentChainFromBlockRequest",
             {"startHash": self.start_hash, "includeAcceptedTransactionIds": True},
-            timeout=30
+            timeout=VCP_TIMEOUT_SECONDS
         )
 
         if resp is None:
-            _logger.warning("VCP: empty response from getVirtualSelectedParentChainFromBlockRequest")
+            _logger.warning(f"VCP: empty response from getVirtualSelectedParentChainFromBlockRequest. "
+                            f"Retrying in {VCP_RETRY_DELAY_SECONDS}s.")
+            await asyncio.sleep(VCP_RETRY_DELAY_SECONDS)
             return
 
         vcp_resp = resp.get("getVirtualSelectedParentChainFromBlockResponse", {})
