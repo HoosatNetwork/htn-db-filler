@@ -427,7 +427,7 @@ class BlocksProcessor(object):
                 batch_num = i // BATCH_SIZE + 1
 
                 with session_maker() as sess:
-                    sess.execute(text("SET LOCAL statement_timeout = '90s'"))
+                    sess.execute(text("SET LOCAL statement_timeout = '300s'"))
                     sess.execute(text("SET LOCAL lock_timeout = '20s'"))
 
                     # 1. Simple outputs mapping (fast)
