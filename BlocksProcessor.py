@@ -441,16 +441,21 @@ class BlocksProcessor(object):
                         ON CONFLICT DO NOTHING
                     """), {"tx_ids": batch})
 
-                    # 2. Inputs mapping - split into two steps to reduce complexity
-                    # First get previous outputs
+                    # 2. Inputs mapping - LATERAL + LIMIT forces a per-input index
+                    # lookup on (transaction_id, index) instead of a full scan
+                    # of transactions_outputs
                     sess.execute(text("""
                         INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
                         SELECT i.transaction_id, o.script_public_key_address, t.block_time
                         FROM transactions_inputs i
-                        JOIN transactions_outputs o 
-                            ON o.transaction_id = i.previous_outpoint_hash 
-                        AND o.index = i.previous_outpoint_index
                         JOIN transactions t ON t.transaction_id = i.transaction_id
+                        CROSS JOIN LATERAL (
+                            SELECT po.script_public_key_address
+                            FROM transactions_outputs po
+                            WHERE po.transaction_id = i.previous_outpoint_hash
+                            AND po.index = i.previous_outpoint_index
+                            LIMIT 1
+                        ) o
                         WHERE i.transaction_id = ANY(:tx_ids)
                         AND o.script_public_key_address IS NOT NULL
                         ON CONFLICT DO NOTHING
