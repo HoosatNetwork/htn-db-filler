@@ -25,6 +25,19 @@ _logger = logging.getLogger(__name__)
 CLUSTER_SIZE = 5
 CATCH_UP_CLUSTER_SIZE = 500
 CLUSTER_WAIT_SECONDS = 1
+# Wait this long before asking for the same window again when nothing to resume from
+# could be found or fetched (see blockiter / _resume_from): longer than the node's 1 s
+# getBlocks response cache, so the retry gets a fresh window.
+NO_CHAIN_BLOCK_WAIT_SECONDS = int(os.getenv("NO_CHAIN_BLOCK_WAIT_SECONDS", "10"))
+# After this many consecutive such rounds the warning becomes an error and the wait grows
+# to RESUME_SLOW_WAIT_SECONDS. The iterator keeps asking and never raises: main.py would
+# restart the whole walk from the start hash and drop the uncommitted queue.
+RESUME_FAST_ATTEMPTS = int(os.getenv("RESUME_FAST_ATTEMPTS", "6"))
+RESUME_SLOW_WAIT_SECONDS = int(os.getenv("RESUME_SLOW_WAIT_SECONDS", "60"))
+# Timeout of one getBlockRequest used to fetch a block the window did not serve.
+GET_BLOCK_TIMEOUT_SECONDS = int(os.getenv("GET_BLOCK_TIMEOUT_SECONDS", "30"))
+# How many selected parents a non-chain low hash is followed down to its chain ancestor.
+CHAIN_ANCESTOR_MAX_STEPS = 1000
 
 B_TREE_SIZE = 2500
 
@@ -38,6 +51,121 @@ STATEMENT_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_STATEMENT_TIMEOUT_MS", "60
 BATCH_SIZE = int(os.getenv("TX_BATCH_SIZE", "100"))
 
 task_runner = None
+
+
+class _ResumeFailed(Exception):
+    """Neither route of BlocksProcessor._resume_from produced a resume point; the message says why."""
+
+
+def _is_chain_block(block):
+    # MessageToDict leaves false booleans out, so a missing key means False.
+    return bool(block.get("verboseData", {}).get("isChainBlock", False))
+
+
+def _selected_parent(block):
+    return block.get("verboseData", {}).get("selectedParentHash")
+
+
+def _blue_score(block):
+    # uint64 fields arrive as strings from MessageToDict.
+    return int(block["header"].get("blueScore", 0))
+
+
+def _blue_work_key(item):
+    # The node's own window order (syncmanager/antipast.go sortInTopologicalOrder): blue
+    # work ascending, ties by hash. Blue work grows from every block to its children, so
+    # no block sorts before one of its ancestors.
+    block_hash, block = item
+    return int(block["header"].get("blueWork") or "0", 16), block_hash
+
+
+def _merge_set(block):
+    # The selected parent is the first blue (ghostdagmanager/ghostdag.go), so this is the
+    # whole merge set and past(block) = past(selected parent) + merge set.
+    verbose = block.get("verboseData", {})
+    return verbose.get("mergeSetBluesHashes", []) + verbose.get("mergeSetRedsHashes", [])
+
+
+def _missing_past(block_hash, anchor_hash, by_hash, held):
+    """
+    The merge-set members the window lacks on the selected parent chain from the chain
+    block block_hash down to the anchor, as a list, or None when that chain itself is not
+    in the window (a block on it is missing from the window or is not a chain block).
+    Members in `held` (blocks the database holds already) are never missing, and the walk
+    may stop at a held chain block, whose whole past is held too.
+
+    HTND adds a chain block's merge set to the window only when its walk dequeues that
+    block (syncmanager/antipast.go); a chain block can also appear in the window earlier,
+    as a member of a non-chain block's merge set, while the merge sets of the chain blocks
+    below it have not been served yet. Resuming from such a block would skip those merge
+    sets for good, because the next window filters out its whole past. The node's own IBD
+    only ever resumes from a dequeued chain block (actualHighHash); this walk recovers
+    that distinction from the data the response carries and names the blocks that have to
+    be fetched by hash before the candidate is a safe resume point.
+    """
+    missing = []
+    seen = set()
+    current = block_hash
+    steps = 0
+    while current != anchor_hash and current not in held:
+        block = by_hash.get(current)
+        if block is None or not _is_chain_block(block):
+            return None
+        for member in _merge_set(block):
+            if member != anchor_hash and member not in by_hash and member not in held \
+                    and member not in seen:
+                seen.add(member)
+                missing.append(member)
+        current = _selected_parent(block)
+        steps += 1
+        if not current or steps > len(by_hash):
+            return None
+    return missing
+
+
+def _resume_candidate(anchor_hash, by_hash, held):
+    """
+    (hash, missing merge-set members) of the block to resume getBlocks from, or
+    (None, None) when the window holds no chain block above the anchor whose selected
+    parent chain down to the anchor is in the window.
+
+    HTND answers getBlocks(lowHash) with the merge sets of the blocks above the low
+    hash's nearest chain ancestor (the anchor), stops once more than MergeSetSizeLimit + 1
+    hashes are collected and sorts the list by blue work (rpchandlers/get_blocks.go,
+    syncmanager/antipast.go). Its last element is therefore the heaviest block of the
+    window, which need not be on the selected parent chain, and a non-chain low hash is
+    slid back to its chain ancestor on the next call, so resuming from it serves the
+    same window again. Two sibling blocks that each end the other's window make the
+    iterator alternate between them forever (explorer-eu, 2026-10-14 02:22, blocks
+    a30316af and 5cfd8d2b). A chain block is never slid back, so only a chain block is a
+    safe resume point, and only one whose past is held: by earlier windows, by this
+    window, or by the blocks fetched for it. The node's own IBD keeps exactly that
+    checkpoint (actualHighHash); the RPC response just does not carry it.
+
+    Candidates are the chain blocks of the window other than the anchor, highest blue
+    score first. The first one whose chain down to the anchor is in the window and whose
+    merge sets on that chain the window holds entirely wins, with nothing to fetch;
+    failing that, the one with the fewest missing members, which are then fetched.
+    """
+    candidates = []
+    for block_hash, block in by_hash.items():
+        if block_hash != anchor_hash and block_hash not in held and _is_chain_block(block):
+            candidates.append((_blue_score(block), block_hash))
+    candidates.sort(reverse=True)
+
+    best = None
+    for _, block_hash in candidates:
+        missing = _missing_past(block_hash, anchor_hash, by_hash, held)
+        if missing is None:
+            continue
+        if not missing:
+            return block_hash, missing
+        if best is None or len(missing) < len(best[1]):
+            best = (block_hash, missing)
+    if best is not None:
+        return best
+    return None, None
+
 
 class BlocksProcessor(object):
     """
@@ -134,8 +262,128 @@ class BlocksProcessor(object):
 
         task_runner.add_done_callback(on_task_done)
 
+    async def _fetch_block(self, block_hash, include_transactions):
+        """
+        One block by getBlockRequest, in the same dict shape as a getBlocks block (header,
+        transactions, verboseData: both handlers build it with DomainBlockToRPCBlock and
+        PopulateRPCBlockWithVerboseData). Raises _ResumeFailed on a timeout, an RPC error,
+        or the empty answer a node gives while it is not nearly synced
+        (rpchandlers/get_block.go).
+        """
+        resp = await self.client.request("getBlockRequest", {
+            "hash": block_hash,
+            "includeTransactions": include_transactions
+        }, timeout=GET_BLOCK_TIMEOUT_SECONDS)
+        if resp is None:
+            raise _ResumeFailed(f'getBlock {block_hash} got no response')
+        block_response = resp.get("getBlockResponse", {})
+        error = block_response.get("error")
+        if error:
+            message = error.get("message", error) if isinstance(error, dict) else error
+            raise _ResumeFailed(f'getBlock {block_hash} failed: {message}')
+        block = block_response.get("block")
+        if not block or "header" not in block or "verboseData" not in block:
+            raise _ResumeFailed(f'getBlock {block_hash} returned no block (node not nearly synced?)')
+        return block
+
+    async def _fetch_blocks(self, block_hashes):
+        """Full blocks for the hashes, as (hash, block) pairs in blue work order."""
+        fetched = []
+        for block_hash in block_hashes:
+            fetched.append((block_hash, await self._fetch_block(block_hash, True)))
+        fetched.sort(key=_blue_work_key)
+        return fetched
+
+    async def _anchor(self, low_hash, by_hash):
+        """
+        (anchor, held): the low hash's nearest chain ancestor, from which the node built the
+        window (syncmanager/antipast.go findLowHashInHighHashSelectedParentChain), and the
+        blocks between the two, which the database holds already. A chain low hash is its
+        own anchor. A non-chain one (the first round after a restart from a non-chain block,
+        or after a reorg) is followed down its selected parents with getBlock: the window
+        excludes the low hash's whole past, and that past is the anchor's past plus the
+        merge sets of the blocks walked here.
+        """
+        held = set()
+        current_hash = low_hash
+        current = by_hash.get(low_hash)
+        steps = 0
+        while True:
+            if current is None:
+                current = await self._fetch_block(current_hash, False)
+            if _is_chain_block(current):
+                return current_hash, held
+            held.add(current_hash)
+            held.update(_merge_set(current))
+            current_hash = _selected_parent(current)
+            current = by_hash.get(current_hash)
+            steps += 1
+            if not current_hash or steps > CHAIN_ANCESTOR_MAX_STEPS:
+                raise _ResumeFailed(f'no chain block within {steps} selected parents of {low_hash}')
+
+    async def _chain_child(self, anchor_hash):
+        """
+        The chain block whose selected parent is the anchor, found through getBlock's
+        childrenHashes (every DAG child), isChainBlock and selectedParentHash, all read
+        fresh. Raises _ResumeFailed when no child qualifies: the anchor is the virtual
+        selected parent, or the chain moved between the calls.
+        """
+        anchor = await self._fetch_block(anchor_hash, False)
+        best = None
+        for child_hash in anchor.get("verboseData", {}).get("childrenHashes", []):
+            child = await self._fetch_block(child_hash, False)
+            if not _is_chain_block(child) or _selected_parent(child) != anchor_hash:
+                continue
+            key = (_blue_score(child), child_hash)
+            if best is None or key > best[0]:
+                best = (key, child_hash)
+        if best is None:
+            raise _ResumeFailed(f'{anchor_hash} has no chain child (it is the virtual selected parent, '
+                                f'or the chain moved)')
+        return best[1]
+
+    async def _resume_from(self, low_hash, block_hashes, blocks):
+        """
+        Where to resume getBlocks after a window, as (next_hash, next_block, fetched): the
+        chain block to use as the next low hash, its block, and the (hash, block) pairs the
+        window did not serve but the next low hash's past needs, fetched by getBlock, in
+        blue work order. Raises _ResumeFailed when neither route works.
+
+        Route 1: a chain block of the window whose chain down to the anchor is in the
+        window; merge-set members that chain lacks are fetched (_resume_candidate).
+        Route 2: the window holds no such block, because the walk's budget ran out on the
+        merge sets of non-chain children of the anchor before its chain child was dequeued
+        (explorer-eu, 2026-10-14 12:14, low hash 9ffb5fbb: 183 blocks, three non-chain
+        children with 179 reds each, the chain child 65a7bef7 absent). Then the chain child
+        is found through getBlock and fetched together with the members of its merge set
+        that are neither in the window nor held: past(child) is past(anchor) plus the
+        child's merge set, and past(anchor) is held, so that is exactly what completeness
+        needs.
+        """
+        by_hash = dict(zip(block_hashes, blocks))
+        anchor_hash, held = await self._anchor(low_hash, by_hash)
+
+        next_hash, missing = _resume_candidate(anchor_hash, by_hash, held)
+        if next_hash is not None:
+            if missing:
+                _logger.warning(f'Chain block {next_hash} of the getBlocks window from {low_hash} lacks '
+                                f'{len(missing)} merge-set members in the window; fetching them by getBlock.')
+            return next_hash, by_hash[next_hash], await self._fetch_blocks(missing)
+
+        child_hash = await self._chain_child(anchor_hash)
+        child = await self._fetch_block(child_hash, True)
+        members = [member for member in _merge_set(child)
+                   if member != anchor_hash and member not in by_hash and member not in held]
+        _logger.warning(f'getBlocks window from {low_hash} ({len(block_hashes)} blocks) holds no chain block '
+                        f'above it whose past is in the window; resuming from the chain child {child_hash} '
+                        f'of {anchor_hash} with {len(members)} merge-set members fetched by getBlock.')
+        fetched = await self._fetch_blocks(members)
+        fetched.append((child_hash, child))
+        return child_hash, child, fetched
+
     async def blockiter(self, start_point):
         low_hash = start_point
+        resume_failures = 0
         while True:
             _logger.info('Requesting with low hash block %s.', low_hash)
             daginfo = await self.client.request("getBlockDagInfoRequest", {})
@@ -190,11 +438,36 @@ class BlocksProcessor(object):
                 await asyncio.sleep(CLUSTER_WAIT_SECONDS)
             else:
                 if advanced and block_hashes:
-                    # Advance to the last block, regardless of age
-                    last_hash = block_hashes[-1]
-                    last_time = int(blocks[-1]["header"]["timestamp"]) // 1000
-                    low_hash = last_hash
-                    self.last_block_time = max(self.last_block_time, last_time)
+                    # Advance to a chain block whose past has been served, never to the last
+                    # block: that is the heaviest block, chain or not, and a non-chain low
+                    # hash makes the node serve the same window again (_resume_candidate).
+                    # Blocks the window failed to serve are fetched by hash and yielded
+                    # here, through the same path as window blocks.
+                    try:
+                        next_hash, next_block, fetched = await self._resume_from(low_hash, block_hashes, blocks)
+                    except _ResumeFailed as failure:
+                        resume_failures += 1
+                        if resume_failures <= RESUME_FAST_ATTEMPTS:
+                            wait, log = NO_CHAIN_BLOCK_WAIT_SECONDS, _logger.warning
+                        else:
+                            wait, log = RESUME_SLOW_WAIT_SECONDS, _logger.error
+                        log(f'No block to resume from after the getBlocks window from {low_hash} '
+                            f'({len(block_hashes)} blocks): {failure} (round {resume_failures}). '
+                            f'Waiting {wait}s and asking again.')
+                        await asyncio.sleep(wait)
+                        continue
+                    resume_failures = 0
+                    for fetched_hash, fetched_block in fetched:
+                        yield fetched_hash, fetched_block
+                        fetched_time = int(fetched_block["header"]["timestamp"]) // 1000
+                        if fetched_time >= self.last_block_time:
+                            self.last_block_time = fetched_time
+                    if fetched:
+                        _logger.info(f'Yielded {len(fetched)} blocks fetched by getBlock after the window '
+                                     f'from {low_hash[:8]}...')
+                    low_hash = next_hash
+                    next_time = int(next_block["header"]["timestamp"]) // 1000
+                    self.last_block_time = max(self.last_block_time, next_time)
                 else:
                     _logger.info("No progress. Waiting...")
                     await asyncio.sleep(0.5)
