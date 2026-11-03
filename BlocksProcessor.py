@@ -397,7 +397,7 @@ class BlocksProcessor(object):
                 "lowHash": low_hash,
                 "includeTransactions": True,
                 "includeBlocks": True
-            }, timeout=30)
+            }, timeout=90)
             req_duration = time.time() - start_req
             _logger.debug(f'getBlocksRequest took {req_duration:.3f}s for lowHash {low_hash[:8]}...')
 
