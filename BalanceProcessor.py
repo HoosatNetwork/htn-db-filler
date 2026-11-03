@@ -34,7 +34,7 @@ class BalanceProcessor(object):
         self._rpc_timeout_seconds = float(os.getenv("BALANCE_RPC_TIMEOUT_SECONDS", "180"))
         self._retry_base_delay_seconds = float(os.getenv("BALANCE_RETRY_BASE_DELAY_SECONDS", "1"))
         self._retry_max_delay_seconds = float(os.getenv("BALANCE_RETRY_MAX_DELAY_SECONDS", "60"))
-        self._retry_max_attempts = int(os.getenv("BALANCE_RETRY_MAX_ATTEMPTS", "5"))
+        self._retry_max_attempts = int(os.getenv("BALANCE_RETRY_MAX_ATTEMPTS", "10"))
         self._threaded = os.getenv("BALANCE_THREADED", "True").lower() in ["true", "1", "t", "y", "yes"]
 
         self._pending_lock = threading.Lock()
