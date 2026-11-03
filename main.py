@@ -46,6 +46,37 @@ if not htnd_hosts:
 # create Htnd client
 client = HtndMultiClient(htnd_hosts)
 
+# A saved start point more than this many blue-score behind the newest block we already hold is stale.
+RESUME_MARGIN_BLUE_SCORE = int(os.getenv("RESUME_MARGIN_BLUE_SCORE", "1000"))
+
+
+async def resume_hash_if_bookmark_is_stale(bookmark_hash):
+    """Return a block hash to resume from when the saved bookmark is far behind blocks already in the
+    database (e.g. a re-walk was interrupted), otherwise None. Never moves forward past data we do not hold."""
+    from dbsession import session_maker
+    from models.Block import Block
+
+    with session_maker() as session:
+        top = session.query(Block.blue_score).order_by(Block.blue_score.desc()).first()
+        mark = session.query(Block.blue_score).filter(Block.hash == bookmark_hash).first()
+        if top is None or mark is None or mark[0] + RESUME_MARGIN_BLUE_SCORE >= top[0]:
+            return None
+        cand = session.query(Block.hash, Block.blue_score) \
+            .filter(Block.blue_score <= top[0] - RESUME_MARGIN_BLUE_SCORE) \
+            .order_by(Block.blue_score.desc()).first()
+    if cand is None:
+        return None
+    resp = await client.request("getBlockRequest",
+                                params={"hash": cand[0], "includeTransactions": False},
+                                timeout=60)
+    if resp is None or "getBlockResponse" not in resp or not resp["getBlockResponse"].get("block"):
+        _logger.warning("Resume candidate %s is unknown to the node; keeping saved bookmark.", cand[0])
+        return None
+    _logger.warning("Saved bookmark %s (blue score %s) is far behind newest stored block (blue score %s); "
+                    "resuming from %s (blue score %s) instead.",
+                    bookmark_hash, mark[0], top[0], cand[0], cand[1])
+    return cand[0]
+
 
 async def main():
     # initialize htnds
@@ -74,6 +105,11 @@ async def main():
 
     find_start_block_str = os.getenv('FIND_START_BLOCK', 'False')  # Default to 'False' if not set
     find_start_block = find_start_block_str.lower() in ['true', '1', 't', 'y', 'yes']
+
+    if env_start_hash is None and not find_start_block and start_hash:
+        fresher = await resume_hash_if_bookmark_is_stale(start_hash)
+        if fresher:
+            start_hash = fresher
 
     _logger.info(f"Find start block: {find_start_block}")
     _logger.info(f"Start hash: {start_hash}")
@@ -142,18 +178,20 @@ async def main():
             await asyncio.sleep(refresh_every_seconds)
 
     # create instances of blocksprocessor and virtualchainprocessor
-    vcp = VirtualChainProcessor(client, start_hash, start_block)
+    vcp = VirtualChainProcessor(client, start_hash=start_hash, start_block=start_block)
     bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
 
     # start blocks processor working concurrent
     restart_attempts = 0
+    resume_hash = start_hash
     while True:
         try:
-            await bp.loop(start_hash)
+            await bp.loop(resume_hash)
             # If the loop returns without exception, restart gracefully
             _logger.error('BlocksProcessor.loop exited unexpectedly without exception. Restarting in 5s.')
             await asyncio.sleep(5)
-            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
+            resume_hash = bp.last_committed_hash or resume_hash
+            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance, vcp_positioned=True)
             restart_attempts = 0
             continue
         except Exception:
@@ -161,8 +199,11 @@ async def main():
             backoff = min(60, 2 ** min(restart_attempts, 6))
             _logger.exception('BlocksProcessor.loop crashed; restarting after %ss (attempt %s).', backoff, restart_attempts)
             await asyncio.sleep(backoff)
+            # Resume from the newest fully committed block, not from the container's boot-time start point.
+            resume_hash = bp.last_committed_hash or resume_hash
+            _logger.info('Restarting block processing from %s', resume_hash)
             # recreate the processor to ensure a clean state
-            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
+            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance, vcp_positioned=True)
             continue
 
 
