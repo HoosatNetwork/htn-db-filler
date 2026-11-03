@@ -172,7 +172,7 @@ class BlocksProcessor(object):
     BlocksProcessor polls hoosat for blocks and adds the meta information and it's transactions into database.
     """
 
-    def __init__(self, client, vcp_instance, balance, batch_processing = False, env_enable_balance = False):
+    def __init__(self, client, vcp_instance, balance, batch_processing = False, env_enable_balance = False, vcp_positioned = False):
         self.client = client
         self.blocks_to_add = []
         self.balance = balance
@@ -184,7 +184,11 @@ class BlocksProcessor(object):
         self.vcp = vcp_instance
         self.env_enable_balance = env_enable_balance
         self.batch_processing = batch_processing
-        self.start_hash_set = False
+        # True when the VCP already has a valid start point (loop restarted after a crash), so it must not be moved back.
+        self.start_hash_set = vcp_positioned
+
+        # Hash of the newest block whose cluster was fully committed; the restart point after a crash.
+        self.last_committed_hash = None
 
         # Did the loop already see the DAG tip
         self.synced = False
@@ -212,6 +216,8 @@ class BlocksProcessor(object):
                     await self.commit_txs()
                 else: 
                     await self.batch_commit_txs()
+                if not self.blocks_to_add:
+                    self.last_committed_hash = block_hash
                 asyncio.create_task(self.handle_blocks_committed())
                 # Update balances whenever a cluster is committed, not only at tip
                 if self.env_enable_balance != False:
