@@ -106,17 +106,23 @@ async def main():
     find_start_block_str = os.getenv('FIND_START_BLOCK', 'False')  # Default to 'False' if not set
     find_start_block = find_start_block_str.lower() in ['true', '1', 't', 'y', 'yes']
 
+    # The blocks-walk may resume from a point ahead of the saved bookmark (see below), but the VCP
+    # must stay anchored to the bookmark itself -- otherwise the acceptance-walk skips the window
+    # between the old bookmark and the newer resume point, and transactions in that window never
+    # get marked Accepted. blocks_resume_hash tracks where BlocksProcessor.loop() should start;
+    # start_hash stays the VCP's anchor.
+    blocks_resume_hash = start_hash
     if env_start_hash is None and not find_start_block and start_hash:
         fresher = await resume_hash_if_bookmark_is_stale(start_hash)
         if fresher:
-            start_hash = fresher
+            blocks_resume_hash = fresher
 
     _logger.info(f"Find start block: {find_start_block}")
     _logger.info(f"Start hash: {start_hash}")
-    if start_hash:
+    if blocks_resume_hash:
         resp = await client.request("getBlockRequest",
                                              params={
-                                                 "hash": start_hash,
+                                                 "hash": blocks_resume_hash,
                                                  "includeTransactions": True,
                                              },
                                              timeout=60)
@@ -125,19 +131,22 @@ async def main():
 
     if find_start_block:
         _logger.info("Finding start block from database (highest processed block)...")
-        
+
         from dbsession import session_maker
-        from models.Block import Block  
+        from models.Block import Block
 
         with session_maker() as session:
             # Get the block with the highest blue score / timestamp / height
             highest_block = session.query(Block).order_by(
-                Block.blue_score.desc(),   
-                Block.timestamp.desc()     
+                Block.blue_score.desc(),
+                Block.timestamp.desc()
             ).first()
 
             if highest_block:
+                # Explicit override: both the VCP anchor and the blocks-walk start from the
+                # same requested point here, there is no bookmark to preserve.
                 start_hash = highest_block.hash
+                blocks_resume_hash = highest_block.hash
                 _logger.info(f"✅ Found highest block in DB: {start_hash} (blueScore={highest_block.blue_score})")
             else:
                 _logger.warning("No blocks found in database. Falling back to genesis/nearest virtual parent.")
@@ -146,6 +155,7 @@ async def main():
                 if daginfo and "getBlockDagInfoResponse" in daginfo:
                     virtualParentHash = daginfo["getBlockDagInfoResponse"]["virtualParentHashes"][0]
                     start_hash = virtualParentHash
+                    blocks_resume_hash = virtualParentHash
 
     batch_processing_str = os.getenv('BATCH_PROCESSING', 'False')  # Default to 'False' if not set
     batch_processing = batch_processing_str.lower() in ['true', '1', 't', 'y', 'yes']
@@ -183,7 +193,7 @@ async def main():
 
     # start blocks processor working concurrent
     restart_attempts = 0
-    resume_hash = start_hash
+    resume_hash = blocks_resume_hash
     while True:
         try:
             await bp.loop(resume_hash)
