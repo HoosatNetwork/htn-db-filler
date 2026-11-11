@@ -543,7 +543,7 @@ class BlocksProcessor(object):
                         for index, out in enumerate(transaction.get("outputs", [])):
                             address = out["verboseData"].get("scriptPublicKeyAddress")
                             amount = out["amount"]
-                            if self.env_enable_balance != False and self.synced == True: 
+                            if self.env_enable_balance != False:
                                 if address not in self.addresses_to_update:
                                     self.addresses_to_update.append(address)
                             self.txs_output.append(TransactionOutput(transaction_id=tx_id,
