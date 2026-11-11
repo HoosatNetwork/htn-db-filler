@@ -69,7 +69,12 @@ async def resume_hash_if_bookmark_is_stale(bookmark_hash):
     resp = await client.request("getBlockRequest",
                                 params={"hash": cand[0], "includeTransactions": False},
                                 timeout=60)
-    if resp is None or "getBlockResponse" not in resp or not resp["getBlockResponse"].get("block"):
+    if resp is None:
+        # client.request() also returns None on a gRPC timeout, not only when the node has
+        # genuinely never seen the hash -- don't report a timeout as "unknown to the node".
+        _logger.warning("Resume candidate %s: no response from node (timed out?); keeping saved bookmark.", cand[0])
+        return None
+    if "getBlockResponse" not in resp or not resp["getBlockResponse"].get("block"):
         _logger.warning("Resume candidate %s is unknown to the node; keeping saved bookmark.", cand[0])
         return None
     _logger.warning("Saved bookmark %s (blue score %s) is far behind newest stored block (blue score %s); "
@@ -187,9 +192,15 @@ async def main():
             )
             await asyncio.sleep(refresh_every_seconds)
 
-    # create instances of blocksprocessor and virtualchainprocessor
+    # create instances of blocksprocessor and virtualchainprocessor.
+    # When the guard above moved blocks_resume_hash ahead of start_hash, the VCP is anchored to
+    # start_hash (the bookmark) here, but BlocksProcessor.loop() would otherwise call
+    # vcp.set_start_block() on the first block it sees -- which is at blocks_resume_hash, not the
+    # bookmark -- undoing this anchor immediately. Passing vcp_positioned=True in that case stops
+    # that first-block call from firing.
     vcp = VirtualChainProcessor(client, start_hash=start_hash, start_block=start_block)
-    bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
+    bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance,
+                          vcp_positioned=(blocks_resume_hash != start_hash))
 
     # start blocks processor working concurrent
     restart_attempts = 0

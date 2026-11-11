@@ -190,6 +190,11 @@ class BlocksProcessor(object):
         # Hash of the newest block whose cluster was fully committed; the restart point after a crash.
         self.last_committed_hash = None
 
+        # blockiter's low_hash as of the start of its current window request. Only ever advances
+        # once a window is confirmed served/exhausted, unlike a per-block hash from inside that
+        # window -- used as the crash-restart point instead, see loop() below.
+        self.current_low_hash = None
+
         # Did the loop already see the DAG tip
         self.synced = False
 
@@ -217,7 +222,12 @@ class BlocksProcessor(object):
                 else: 
                     await self.batch_commit_txs()
                 if not self.blocks_to_add:
-                    self.last_committed_hash = block_hash
+                    # Use the window's low_hash, not this block's own hash: at the tip, if the
+                    # node's getBlocks window didn't actually extend as far as this block (a rare
+                    # race against a concurrently-advancing tip), a child could be yielded before
+                    # its parent, and resuming from the child's hash would permanently skip that
+                    # parent. low_hash only ever advances once a window is confirmed served.
+                    self.last_committed_hash = self.current_low_hash or block_hash
                 asyncio.create_task(self.handle_blocks_committed())
                 # Update balances whenever a cluster is committed, not only at tip
                 if self.env_enable_balance != False:
@@ -391,6 +401,7 @@ class BlocksProcessor(object):
         low_hash = start_point
         resume_failures = 0
         while True:
+            self.current_low_hash = low_hash
             _logger.info('Requesting with low hash block %s.', low_hash)
             daginfo = await self.client.request("getBlockDagInfoRequest", {})
             if daginfo is None:
