@@ -509,7 +509,7 @@ class BlocksProcessor(object):
                         for index, out in enumerate(transaction.get("outputs", [])):
                             address = out["verboseData"].get("scriptPublicKeyAddress")
                             amount = out["amount"]
-                            if self.env_enable_balance != False and self.synced == True: 
+                            if self.env_enable_balance != False:
                                 if address not in self.addresses_to_update:
                                     self.addresses_to_update.append(address)
                             self.txs_output.append(TransactionOutput(transaction_id=tx_id,
@@ -520,7 +520,7 @@ class BlocksProcessor(object):
                                                                     script_public_key_type=out["verboseData"].get("scriptPublicKeyType")))
 
                         for index, tx_in in enumerate(transaction.get("inputs", [])):
-                            if self.env_enable_balance != False and self.synced == True: 
+                            if self.env_enable_balance != False:
                                 prev_out_tx_id = tx_in["previousOutpoint"]["transactionId"]
                                 prev_out_index = int(tx_in["previousOutpoint"].get("index", 0))
                                 with session_maker() as session:
