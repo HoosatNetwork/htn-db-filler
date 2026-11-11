@@ -46,6 +46,42 @@ if not htnd_hosts:
 # create Htnd client
 client = HtndMultiClient(htnd_hosts)
 
+# A saved start point more than this many blue-score behind the newest block we already hold is stale.
+RESUME_MARGIN_BLUE_SCORE = int(os.getenv("RESUME_MARGIN_BLUE_SCORE", "1000"))
+
+
+async def resume_hash_if_bookmark_is_stale(bookmark_hash):
+    """Return a block hash to resume from when the saved bookmark is far behind blocks already in the
+    database (e.g. a re-walk was interrupted), otherwise None. Never moves forward past data we do not hold."""
+    from dbsession import session_maker
+    from models.Block import Block
+
+    with session_maker() as session:
+        top = session.query(Block.blue_score).order_by(Block.blue_score.desc()).first()
+        mark = session.query(Block.blue_score).filter(Block.hash == bookmark_hash).first()
+        if top is None or mark is None or mark[0] + RESUME_MARGIN_BLUE_SCORE >= top[0]:
+            return None
+        cand = session.query(Block.hash, Block.blue_score) \
+            .filter(Block.blue_score <= top[0] - RESUME_MARGIN_BLUE_SCORE) \
+            .order_by(Block.blue_score.desc()).first()
+    if cand is None:
+        return None
+    resp = await client.request("getBlockRequest",
+                                params={"hash": cand[0], "includeTransactions": False},
+                                timeout=60)
+    if resp is None:
+        # client.request() also returns None on a gRPC timeout, not only when the node has
+        # genuinely never seen the hash -- don't report a timeout as "unknown to the node".
+        _logger.warning("Resume candidate %s: no response from node (timed out?); keeping saved bookmark.", cand[0])
+        return None
+    if "getBlockResponse" not in resp or not resp["getBlockResponse"].get("block"):
+        _logger.warning("Resume candidate %s is unknown to the node; keeping saved bookmark.", cand[0])
+        return None
+    _logger.warning("Saved bookmark %s (blue score %s) is far behind newest stored block (blue score %s); "
+                    "resuming from %s (blue score %s) instead.",
+                    bookmark_hash, mark[0], top[0], cand[0], cand[1])
+    return cand[0]
+
 
 async def main():
     # initialize htnds
@@ -75,12 +111,23 @@ async def main():
     find_start_block_str = os.getenv('FIND_START_BLOCK', 'False')  # Default to 'False' if not set
     find_start_block = find_start_block_str.lower() in ['true', '1', 't', 'y', 'yes']
 
+    # The blocks-walk may resume from a point ahead of the saved bookmark (see below), but the VCP
+    # must stay anchored to the bookmark itself -- otherwise the acceptance-walk skips the window
+    # between the old bookmark and the newer resume point, and transactions in that window never
+    # get marked Accepted. blocks_resume_hash tracks where BlocksProcessor.loop() should start;
+    # start_hash stays the VCP's anchor.
+    blocks_resume_hash = start_hash
+    if env_start_hash is None and not find_start_block and start_hash:
+        fresher = await resume_hash_if_bookmark_is_stale(start_hash)
+        if fresher:
+            blocks_resume_hash = fresher
+
     _logger.info(f"Find start block: {find_start_block}")
     _logger.info(f"Start hash: {start_hash}")
-    if start_hash:
+    if blocks_resume_hash:
         resp = await client.request("getBlockRequest",
                                              params={
-                                                 "hash": start_hash,
+                                                 "hash": blocks_resume_hash,
                                                  "includeTransactions": True,
                                              },
                                              timeout=60)
@@ -89,19 +136,22 @@ async def main():
 
     if find_start_block:
         _logger.info("Finding start block from database (highest processed block)...")
-        
+
         from dbsession import session_maker
-        from models.Block import Block  
+        from models.Block import Block
 
         with session_maker() as session:
             # Get the block with the highest blue score / timestamp / height
             highest_block = session.query(Block).order_by(
-                Block.blue_score.desc(),   
-                Block.timestamp.desc()     
+                Block.blue_score.desc(),
+                Block.timestamp.desc()
             ).first()
 
             if highest_block:
+                # Explicit override: both the VCP anchor and the blocks-walk start from the
+                # same requested point here, there is no bookmark to preserve.
                 start_hash = highest_block.hash
+                blocks_resume_hash = highest_block.hash
                 _logger.info(f"✅ Found highest block in DB: {start_hash} (blueScore={highest_block.blue_score})")
             else:
                 _logger.warning("No blocks found in database. Falling back to genesis/nearest virtual parent.")
@@ -110,6 +160,7 @@ async def main():
                 if daginfo and "getBlockDagInfoResponse" in daginfo:
                     virtualParentHash = daginfo["getBlockDagInfoResponse"]["virtualParentHashes"][0]
                     start_hash = virtualParentHash
+                    blocks_resume_hash = virtualParentHash
 
     batch_processing_str = os.getenv('BATCH_PROCESSING', 'False')  # Default to 'False' if not set
     batch_processing = batch_processing_str.lower() in ['true', '1', 't', 'y', 'yes']
@@ -141,19 +192,27 @@ async def main():
             )
             await asyncio.sleep(refresh_every_seconds)
 
-    # create instances of blocksprocessor and virtualchainprocessor
-    vcp = VirtualChainProcessor(client, start_hash, start_block)
-    bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
+    # create instances of blocksprocessor and virtualchainprocessor.
+    # When the guard above moved blocks_resume_hash ahead of start_hash, the VCP is anchored to
+    # start_hash (the bookmark) here, but BlocksProcessor.loop() would otherwise call
+    # vcp.set_start_block() on the first block it sees -- which is at blocks_resume_hash, not the
+    # bookmark -- undoing this anchor immediately. Passing vcp_positioned=True in that case stops
+    # that first-block call from firing.
+    vcp = VirtualChainProcessor(client, start_hash=start_hash, start_block=start_block)
+    bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance,
+                          vcp_positioned=(blocks_resume_hash != start_hash))
 
     # start blocks processor working concurrent
     restart_attempts = 0
+    resume_hash = blocks_resume_hash
     while True:
         try:
-            await bp.loop(start_hash)
+            await bp.loop(resume_hash)
             # If the loop returns without exception, restart gracefully
             _logger.error('BlocksProcessor.loop exited unexpectedly without exception. Restarting in 5s.')
             await asyncio.sleep(5)
-            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
+            resume_hash = bp.last_committed_hash or resume_hash
+            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance, vcp_positioned=True)
             restart_attempts = 0
             continue
         except Exception:
@@ -161,8 +220,11 @@ async def main():
             backoff = min(60, 2 ** min(restart_attempts, 6))
             _logger.exception('BlocksProcessor.loop crashed; restarting after %ss (attempt %s).', backoff, restart_attempts)
             await asyncio.sleep(backoff)
+            # Resume from the newest fully committed block, not from the container's boot-time start point.
+            resume_hash = bp.last_committed_hash or resume_hash
+            _logger.info('Restarting block processing from %s', resume_hash)
             # recreate the processor to ensure a clean state
-            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance)
+            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance, vcp_positioned=True)
             continue
 
 

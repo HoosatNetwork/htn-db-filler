@@ -172,7 +172,7 @@ class BlocksProcessor(object):
     BlocksProcessor polls hoosat for blocks and adds the meta information and it's transactions into database.
     """
 
-    def __init__(self, client, vcp_instance, balance, batch_processing = False, env_enable_balance = False):
+    def __init__(self, client, vcp_instance, balance, batch_processing = False, env_enable_balance = False, vcp_positioned = False):
         self.client = client
         self.blocks_to_add = []
         self.balance = balance
@@ -184,7 +184,16 @@ class BlocksProcessor(object):
         self.vcp = vcp_instance
         self.env_enable_balance = env_enable_balance
         self.batch_processing = batch_processing
-        self.start_hash_set = False
+        # True when the VCP already has a valid start point (loop restarted after a crash), so it must not be moved back.
+        self.start_hash_set = vcp_positioned
+
+        # Hash of the newest block whose cluster was fully committed; the restart point after a crash.
+        self.last_committed_hash = None
+
+        # blockiter's low_hash as of the start of its current window request. Only ever advances
+        # once a window is confirmed served/exhausted, unlike a per-block hash from inside that
+        # window -- used as the crash-restart point instead, see loop() below.
+        self.current_low_hash = None
 
         # Did the loop already see the DAG tip
         self.synced = False
@@ -212,6 +221,13 @@ class BlocksProcessor(object):
                     await self.commit_txs()
                 else: 
                     await self.batch_commit_txs()
+                if not self.blocks_to_add:
+                    # Use the window's low_hash, not this block's own hash: at the tip, if the
+                    # node's getBlocks window didn't actually extend as far as this block (a rare
+                    # race against a concurrently-advancing tip), a child could be yielded before
+                    # its parent, and resuming from the child's hash would permanently skip that
+                    # parent. low_hash only ever advances once a window is confirmed served.
+                    self.last_committed_hash = self.current_low_hash or block_hash
                 asyncio.create_task(self.handle_blocks_committed())
                 # Update balances whenever a cluster is committed, not only at tip
                 if self.env_enable_balance != False:
@@ -385,6 +401,7 @@ class BlocksProcessor(object):
         low_hash = start_point
         resume_failures = 0
         while True:
+            self.current_low_hash = low_hash
             _logger.info('Requesting with low hash block %s.', low_hash)
             daginfo = await self.client.request("getBlockDagInfoRequest", {})
             if daginfo is None:
