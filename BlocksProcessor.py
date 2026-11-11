@@ -7,7 +7,7 @@ from datetime import datetime
 import time
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from sqlalchemy.exc import SQLAlchemyError, OperationalError, InterfaceError
 from sqlalchemy import text, bindparam
 
 from dbsession import session_maker, engine
@@ -49,6 +49,11 @@ LOCK_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_LOCK_TIMEOUT_MS", "100"))
 STATEMENT_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_STATEMENT_TIMEOUT_MS", "60000"))
 
 BATCH_SIZE = int(os.getenv("TX_BATCH_SIZE", "100"))
+
+# How many tx-batch / mapping-batch / spent-output-lookup DB operations run concurrently.
+DB_PARALLEL = max(1, int(os.getenv("FILLER_DB_PARALLEL", "1")))
+# Addresses-to-refresh lookup for spent outputs is chunked this large per DB_PARALLEL worker.
+PREV_LOOKUP_CHUNK = int(os.getenv("PREV_LOOKUP_CHUNK", "100"))
 
 task_runner = None
 
@@ -181,6 +186,8 @@ class BlocksProcessor(object):
         self.txs = {}
         self.txs_output = []
         self.txs_input = []
+        # (transaction_id, index) pairs of spent outputs, queued for a batched address lookup.
+        self.prev_outpoints = []
         self.vcp = vcp_instance
         self.env_enable_balance = env_enable_balance
         self.batch_processing = batch_processing
@@ -194,6 +201,10 @@ class BlocksProcessor(object):
         # once a window is confirmed served/exhausted, unlike a per-block hash from inside that
         # window -- used as the crash-restart point instead, see loop() below.
         self.current_low_hash = None
+
+        # tx ids whose address mapping batch gave up after both attempts; retried on the next
+        # mapping run instead of being lost for good (see _process_mapping_inserts_optimized).
+        self.pending_mapping_retry_ids = []
 
         # Did the loop already see the DAG tip
         self.synced = False
@@ -216,11 +227,16 @@ class BlocksProcessor(object):
             cluster_size = CATCH_UP_CLUSTER_SIZE if not self.synced else CLUSTER_SIZE
             if len(self.blocks_to_add) >= cluster_size:
                 _logger.debug(f'Committing {cluster_size} blocks at {block_hash}')
-                await self.commit_blocks()
+                # Transactions must be committed before blocks: handle_blocks_committed()
+                # schedules the VCP's acceptance walk right after this, and that walk only
+                # needs the blocks to be stored to mark a transaction "Accepted" -- if blocks
+                # commit first, a concurrent tx-insert that's still in flight (more likely the
+                # slower FILLER_DB_PARALLEL batches are) can get skipped by the VCP forever.
                 if self.batch_processing == False:
                     await self.commit_txs()
-                else: 
+                else:
                     await self.batch_commit_txs()
+                await self.commit_blocks()
                 if not self.blocks_to_add:
                     # Use the window's low_hash, not this block's own hash: at the tip, if the
                     # node's getBlocks window didn't actually extend as far as this block (a rare
@@ -231,10 +247,11 @@ class BlocksProcessor(object):
                 asyncio.create_task(self.handle_blocks_committed())
                 # Update balances whenever a cluster is committed, not only at tip
                 if self.env_enable_balance != False:
+                    await self._resolve_prev_output_addresses()
                     # Enqueue for background balance worker; do not block block processing
                     self.commit_balances(self.addresses_to_update)
                     self.addresses_to_update = []  # Clear addresses to prevent memory buildup
-                    
+
 
     def commit_balances(self, addresses):
         try:
@@ -537,18 +554,12 @@ class BlocksProcessor(object):
                                                                     script_public_key_type=out["verboseData"].get("scriptPublicKeyType")))
 
                         for index, tx_in in enumerate(transaction.get("inputs", [])):
-                            if self.env_enable_balance != False:
+                            if self.env_enable_balance != False and self.synced == True:
                                 prev_out_tx_id = tx_in["previousOutpoint"]["transactionId"]
                                 prev_out_index = int(tx_in["previousOutpoint"].get("index", 0))
-                                with session_maker() as session:
-                                    prev_output = session.query(TransactionOutput).filter_by(
-                                        transaction_id=prev_out_tx_id,
-                                        index=prev_out_index
-                                    ).first()
-                                    if prev_output:
-                                        address = prev_output.script_public_key_address
-                                        if address not in self.addresses_to_update:
-                                            self.addresses_to_update.append(address)
+                                # Resolved later, in a batch, by _resolve_prev_output_addresses -
+                                # a synchronous per-input query here blocks block processing.
+                                self.prev_outpoints.append((prev_out_tx_id, prev_out_index))
                             self.txs_input.append(TransactionInput(transaction_id=tx_id,
                                                                     index=index,
                                                                     previous_outpoint_hash=tx_in["previousOutpoint"]["transactionId"],
@@ -558,6 +569,46 @@ class BlocksProcessor(object):
                     else:
                         # If the block if already in the Queue, merge the block_hashes.
                         self.txs[tx_id].block_hash = list(set(self.txs[tx_id].block_hash + [block_hash]))
+
+    @staticmethod
+    def _select_output_addresses(ids):
+        with session_maker() as session:
+            rows = session.execute(text(
+                "SELECT o.transaction_id, o.index, o.script_public_key_address "
+                "FROM transactions_outputs o WHERE o.transaction_id = ANY(:ids)"), {"ids": ids}).all()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    async def _resolve_prev_output_addresses(self):
+        """Addresses whose outputs were spent by the committed cluster need a balance refresh."""
+        pending, self.prev_outpoints = self.prev_outpoints, []
+        if not pending:
+            return
+        wanted = {}
+        for tx_id, idx in pending:
+            wanted.setdefault(tx_id, set()).add(idx)
+        ids = list(wanted)
+        sem = asyncio.Semaphore(DB_PARALLEL)
+
+        async def one(chunk):
+            async with sem:
+                for attempt in range(2):
+                    try:
+                        return await asyncio.to_thread(self._select_output_addresses, chunk)
+                    except Exception as e:
+                        _logger.warning(f'Spent-output lookup failed (attempt {attempt + 1}/2): {e}')
+                        await asyncio.sleep(0.5)
+                _logger.error(f'Spent-output lookup gave up for {len(chunk)} transactions; '
+                              f'their balances refresh on the next full balance update')
+                return []
+
+        results = await asyncio.gather(*(one(ids[i:i + PREV_LOOKUP_CHUNK])
+                                         for i in range(0, len(ids), PREV_LOOKUP_CHUNK)))
+        seen = set(self.addresses_to_update)
+        for rows in results:
+            for tx_id, idx, address in rows:
+                if address and idx in wanted.get(tx_id, ()) and address not in seen:
+                    seen.add(address)
+                    self.addresses_to_update.append(address)
 
     async def batch_commit_txs(self):
         """Batch commit with proper handling for transactions that already exist in DB.
@@ -667,33 +718,82 @@ class BlocksProcessor(object):
             return
 
         # ============================================================
-        # Original batch insert logic — now only for NEW transactions
+        # Batch insert logic — now only for NEW transactions. Batches run
+        # concurrently (DB_PARALLEL); a batch that fails retries tx-by-tx so
+        # one bad transaction cannot drop the rest of its batch.
         # ============================================================
-        for i in range(0, len(remaining_tx_ids), BATCH_SIZE):
-            batch_tx_ids = remaining_tx_ids[i:i + BATCH_SIZE]
-            batch_txs = [self.txs[tx_id] for tx_id in batch_tx_ids]
+        outputs_by_tx, inputs_by_tx = {}, {}
+        for out in self.txs_output:
+            outputs_by_tx.setdefault(out.transaction_id, []).append(out)
+        for inp in self.txs_input:
+            inputs_by_tx.setdefault(inp.transaction_id, []).append(inp)
+        txs_map = self.txs
 
-            # Only outputs/inputs belonging to txs we are actually inserting
-            batch_outputs = [out for out in self.txs_output if out.transaction_id in batch_tx_ids]
-            batch_inputs = [inp for inp in self.txs_input if inp.transaction_id in batch_tx_ids]
-
-            with session_maker() as session:
-                try:
-                    session.add_all(batch_txs)
-                    session.add_all(batch_outputs)
-                    session.add_all(batch_inputs)
-
+        def insert_group(group_ids):
+            try:
+                with session_maker() as session:
+                    session.add_all([txs_map[t] for t in group_ids])
+                    session.add_all([o for t in group_ids for o in outputs_by_tx.get(t, [])])
+                    session.add_all([n for t in group_ids for n in inputs_by_tx.get(t, [])])
                     session.flush()
                     session.commit()
+                return list(group_ids)
+            except Exception as e:
+                _logger.warning(f'Tx batch insert failed ({e}); retrying its {len(group_ids)} txs one by one')
+            inserted = []
+            for t in group_ids:
+                try:
+                    with session_maker() as session:
+                        session.add(txs_map[t])
+                        session.add_all(outputs_by_tx.get(t, []))
+                        session.add_all(inputs_by_tx.get(t, []))
+                        session.flush()
+                        session.commit()
+                    inserted.append(t)
+                except IntegrityError:
+                    # Already exists (a second writer, a retry after a lost commit reply, or
+                    # the earlier existence check racing an insert). Merge this cluster's
+                    # block_hash into the stored row instead of just skipping it -- otherwise
+                    # this block's hash is never recorded against the transaction, and since
+                    # it's not in `inserted` it never gets mapped either.
+                    try:
+                        with session_maker() as session:
+                            tx_item = session.query(Transaction).filter(
+                                Transaction.transaction_id == t
+                            ).first()
+                            if tx_item:
+                                new_hashes = txs_map[t].block_hash or []
+                                current_hashes = tx_item.block_hash or []
+                                tx_item.block_hash = list(set(current_hashes) | set(new_hashes))
+                                session.commit()
+                                inserted.append(t)
+                            else:
+                                _logger.error(f'Tx {t} hit IntegrityError but is not stored')
+                    except Exception as e3:
+                        _logger.error(f'Failed merging block hashes of tx {t}: {e3}')
+                except (OperationalError, InterfaceError) as e2:
+                    # Connection-level failure (e.g. DB briefly unavailable) -- raise so this
+                    # cluster's commit fails and gets retried, instead of silently dropping the
+                    # transaction forever (it would never be re-queued; see loop()/main.py).
+                    _logger.error(f'Connection error inserting tx {t}: {e2}; cluster will be retried')
+                    raise
+                except Exception as e2:
+                    # A genuine data error. Don't raise -- a single bad row restarting the walk
+                    # forever would be worse than logging and moving on.
+                    _logger.error(f'Failed inserting tx {t} (not retried): {e2}')
+            return inserted
 
-                    _logger.info(f'Committed batch {i//BATCH_SIZE + 1} ({len(batch_tx_ids)} new txs)')
-                    all_tx_ids_to_map.extend(batch_tx_ids)
+        sem = asyncio.Semaphore(DB_PARALLEL)
 
-                except Exception as e:
-                    session.rollback()
-                    _logger.error(f'Error committing tx batch {i//BATCH_SIZE + 1}: {e}')
-                    # Rare race condition between our check and insert is possible.
-                    # We log and continue — the tx will be retried in a future cluster.
+        async def run_group(group_ids):
+            async with sem:
+                return await asyncio.to_thread(insert_group, group_ids)
+
+        groups = [remaining_tx_ids[i:i + BATCH_SIZE] for i in range(0, len(remaining_tx_ids), BATCH_SIZE)]
+        results = await asyncio.gather(*(run_group(g) for g in groups))
+        for n, (g, inserted) in enumerate(zip(groups, results), start=1):
+            _logger.info(f'Committed batch {n} ({len(inserted)}/{len(g)} new txs)')
+            all_tx_ids_to_map.extend(inserted)
 
         # Mapping (only for newly inserted txs)
         if all_tx_ids_to_map:
@@ -705,57 +805,77 @@ class BlocksProcessor(object):
         self.txs_input = []
 
     async def _process_mapping_inserts_optimized(self, all_tx_ids):
-        """Split mapping into simpler, faster operations."""
+        """Split mapping into simpler, faster operations; batches are independent and run
+        concurrently (DB_PARALLEL), each with its own retry, so one slow/failed batch no
+        longer stops every batch after it."""
+        if self.pending_mapping_retry_ids:
+            all_tx_ids = self.pending_mapping_retry_ids + list(all_tx_ids)
+            self.pending_mapping_retry_ids = []
+
         if not all_tx_ids:
             return
 
         BATCH_SIZE = 60   # Even smaller for the heavy inputs part
 
-        try:
-            for i in range(0, len(all_tx_ids), BATCH_SIZE):
-                batch = all_tx_ids[i:i + BATCH_SIZE]
-                batch_num = i // BATCH_SIZE + 1
+        def run_batch(batch, batch_num):
+            for attempt in range(2):
+                if attempt > 0:
+                    # The two attempts ran back to back before; give a lock/statement timeout
+                    # an actual chance to clear instead of hitting the exact same contention.
+                    time.sleep(2)
+                try:
+                    with session_maker() as sess:
+                        sess.execute(text("SET LOCAL statement_timeout = '300s'"))
+                        sess.execute(text("SET LOCAL lock_timeout = '20s'"))
 
-                with session_maker() as sess:
-                    sess.execute(text("SET LOCAL statement_timeout = '300s'"))
-                    sess.execute(text("SET LOCAL lock_timeout = '20s'"))
+                        # 1. Simple outputs mapping (fast)
+                        sess.execute(text("""
+                            INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
+                            SELECT o.transaction_id, o.script_public_key_address, t.block_time
+                            FROM transactions_outputs o
+                            JOIN transactions t ON t.transaction_id = o.transaction_id
+                            WHERE o.transaction_id = ANY(:tx_ids)
+                            AND o.script_public_key_address IS NOT NULL
+                            ON CONFLICT DO NOTHING
+                        """), {"tx_ids": batch})
 
-                    # 1. Simple outputs mapping (fast)
-                    sess.execute(text("""
-                        INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
-                        SELECT o.transaction_id, o.script_public_key_address, t.block_time
-                        FROM transactions_outputs o
-                        JOIN transactions t ON t.transaction_id = o.transaction_id
-                        WHERE o.transaction_id = ANY(:tx_ids)
-                        AND o.script_public_key_address IS NOT NULL
-                        ON CONFLICT DO NOTHING
-                    """), {"tx_ids": batch})
+                        # 2. Inputs mapping - LATERAL + LIMIT forces a per-input index
+                        # lookup on (transaction_id, index) instead of a full scan
+                        # of transactions_outputs
+                        sess.execute(text("""
+                            INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
+                            SELECT i.transaction_id, o.script_public_key_address, t.block_time
+                            FROM transactions_inputs i
+                            JOIN transactions t ON t.transaction_id = i.transaction_id
+                            CROSS JOIN LATERAL (
+                                SELECT po.script_public_key_address
+                                FROM transactions_outputs po
+                                WHERE po.transaction_id = i.previous_outpoint_hash
+                                AND po.index = i.previous_outpoint_index
+                                LIMIT 1
+                            ) o
+                            WHERE i.transaction_id = ANY(:tx_ids)
+                            AND o.script_public_key_address IS NOT NULL
+                            ON CONFLICT DO NOTHING
+                        """), {"tx_ids": batch})
 
-                    # 2. Inputs mapping - LATERAL + LIMIT forces a per-input index
-                    # lookup on (transaction_id, index) instead of a full scan
-                    # of transactions_outputs
-                    sess.execute(text("""
-                        INSERT INTO tx_id_address_mapping (transaction_id, address, block_time)
-                        SELECT i.transaction_id, o.script_public_key_address, t.block_time
-                        FROM transactions_inputs i
-                        JOIN transactions t ON t.transaction_id = i.transaction_id
-                        CROSS JOIN LATERAL (
-                            SELECT po.script_public_key_address
-                            FROM transactions_outputs po
-                            WHERE po.transaction_id = i.previous_outpoint_hash
-                            AND po.index = i.previous_outpoint_index
-                            LIMIT 1
-                        ) o
-                        WHERE i.transaction_id = ANY(:tx_ids)
-                        AND o.script_public_key_address IS NOT NULL
-                        ON CONFLICT DO NOTHING
-                    """), {"tx_ids": batch})
-
-                    sess.commit()
+                        sess.commit()
                     _logger.info(f"Mapping batch {batch_num} completed ({len(batch)} txs)")
+                    return
+                except Exception as e:
+                    _logger.warning(f"Mapping batch {batch_num} failed (attempt {attempt + 1}/2, non-fatal): {e}")
+            # Retried on the next call to this method instead of lost for good.
+            self.pending_mapping_retry_ids.extend(batch)
+            _logger.error(f"Mapping batch {batch_num} gave up; {len(batch)} txs queued for retry next run")
 
-        except Exception as e:
-            _logger.warning(f"Mapping batch failed (non-fatal): {e}")
+        sem = asyncio.Semaphore(DB_PARALLEL)
+
+        async def run(batch, batch_num):
+            async with sem:
+                await asyncio.to_thread(run_batch, batch, batch_num)
+
+        await asyncio.gather(*(run(all_tx_ids[i:i + BATCH_SIZE], i // BATCH_SIZE + 1)
+                               for i in range(0, len(all_tx_ids), BATCH_SIZE)))
 
     # Original commit_txs
     async def commit_txs(self):
