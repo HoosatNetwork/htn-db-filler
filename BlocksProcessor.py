@@ -7,7 +7,7 @@ from datetime import datetime
 import time
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.exc import SQLAlchemyError, OperationalError
+from sqlalchemy.exc import SQLAlchemyError, OperationalError, InterfaceError
 from sqlalchemy import text, bindparam
 
 from dbsession import session_maker, engine
@@ -51,7 +51,7 @@ STATEMENT_TIMEOUT_MS = int(os.getenv("TX_ADDR_MAPPING_STATEMENT_TIMEOUT_MS", "60
 BATCH_SIZE = int(os.getenv("TX_BATCH_SIZE", "100"))
 
 # How many tx-batch / mapping-batch / spent-output-lookup DB operations run concurrently.
-DB_PARALLEL = max(1, int(os.getenv("FILLER_DB_PARALLEL", "6")))
+DB_PARALLEL = max(1, int(os.getenv("FILLER_DB_PARALLEL", "1")))
 # Addresses-to-refresh lookup for spent outputs is chunked this large per DB_PARALLEL worker.
 PREV_LOOKUP_CHUNK = int(os.getenv("PREV_LOOKUP_CHUNK", "100"))
 
@@ -193,6 +193,10 @@ class BlocksProcessor(object):
         self.batch_processing = batch_processing
         self.start_hash_set = False
 
+        # tx ids whose address mapping batch gave up after both attempts; retried on the next
+        # mapping run instead of being lost for good (see _process_mapping_inserts_optimized).
+        self.pending_mapping_retry_ids = []
+
         # Did the loop already see the DAG tip
         self.synced = False
 
@@ -214,11 +218,16 @@ class BlocksProcessor(object):
             cluster_size = CATCH_UP_CLUSTER_SIZE if not self.synced else CLUSTER_SIZE
             if len(self.blocks_to_add) >= cluster_size:
                 _logger.debug(f'Committing {cluster_size} blocks at {block_hash}')
-                await self.commit_blocks()
+                # Transactions must be committed before blocks: handle_blocks_committed()
+                # schedules the VCP's acceptance walk right after this, and that walk only
+                # needs the blocks to be stored to mark a transaction "Accepted" -- if blocks
+                # commit first, a concurrent tx-insert that's still in flight (more likely the
+                # slower FILLER_DB_PARALLEL batches are) can get skipped by the VCP forever.
                 if self.batch_processing == False:
                     await self.commit_txs()
-                else: 
+                else:
                     await self.batch_commit_txs()
+                await self.commit_blocks()
                 asyncio.create_task(self.handle_blocks_committed())
                 # Update balances whenever a cluster is committed, not only at tip
                 if self.env_enable_balance != False:
@@ -725,9 +734,36 @@ class BlocksProcessor(object):
                         session.commit()
                     inserted.append(t)
                 except IntegrityError:
-                    _logger.info(f'Tx {t} already exists (inserted concurrently); skipping')
+                    # Already exists (a second writer, a retry after a lost commit reply, or
+                    # the earlier existence check racing an insert). Merge this cluster's
+                    # block_hash into the stored row instead of just skipping it -- otherwise
+                    # this block's hash is never recorded against the transaction, and since
+                    # it's not in `inserted` it never gets mapped either.
+                    try:
+                        with session_maker() as session:
+                            tx_item = session.query(Transaction).filter(
+                                Transaction.transaction_id == t
+                            ).first()
+                            if tx_item:
+                                new_hashes = txs_map[t].block_hash or []
+                                current_hashes = tx_item.block_hash or []
+                                tx_item.block_hash = list(set(current_hashes) | set(new_hashes))
+                                session.commit()
+                                inserted.append(t)
+                            else:
+                                _logger.error(f'Tx {t} hit IntegrityError but is not stored')
+                    except Exception as e3:
+                        _logger.error(f'Failed merging block hashes of tx {t}: {e3}')
+                except (OperationalError, InterfaceError) as e2:
+                    # Connection-level failure (e.g. DB briefly unavailable) -- raise so this
+                    # cluster's commit fails and gets retried, instead of silently dropping the
+                    # transaction forever (it would never be re-queued; see loop()/main.py).
+                    _logger.error(f'Connection error inserting tx {t}: {e2}; cluster will be retried')
+                    raise
                 except Exception as e2:
-                    _logger.error(f'Failed inserting tx {t}: {e2}')
+                    # A genuine data error. Don't raise -- a single bad row restarting the walk
+                    # forever would be worse than logging and moving on.
+                    _logger.error(f'Failed inserting tx {t} (not retried): {e2}')
             return inserted
 
         sem = asyncio.Semaphore(DB_PARALLEL)
@@ -755,6 +791,10 @@ class BlocksProcessor(object):
         """Split mapping into simpler, faster operations; batches are independent and run
         concurrently (DB_PARALLEL), each with its own retry, so one slow/failed batch no
         longer stops every batch after it."""
+        if self.pending_mapping_retry_ids:
+            all_tx_ids = self.pending_mapping_retry_ids + list(all_tx_ids)
+            self.pending_mapping_retry_ids = []
+
         if not all_tx_ids:
             return
 
@@ -762,6 +802,10 @@ class BlocksProcessor(object):
 
         def run_batch(batch, batch_num):
             for attempt in range(2):
+                if attempt > 0:
+                    # The two attempts ran back to back before; give a lock/statement timeout
+                    # an actual chance to clear instead of hitting the exact same contention.
+                    time.sleep(2)
                 try:
                     with session_maker() as sess:
                         sess.execute(text("SET LOCAL statement_timeout = '300s'"))
@@ -803,7 +847,9 @@ class BlocksProcessor(object):
                     return
                 except Exception as e:
                     _logger.warning(f"Mapping batch {batch_num} failed (attempt {attempt + 1}/2, non-fatal): {e}")
-            _logger.error(f"Mapping batch {batch_num} gave up; {len(batch)} txs have no address mapping")
+            # Retried on the next call to this method instead of lost for good.
+            self.pending_mapping_retry_ids.extend(batch)
+            _logger.error(f"Mapping batch {batch_num} gave up; {len(batch)} txs queued for retry next run")
 
         sem = asyncio.Semaphore(DB_PARALLEL)
 
