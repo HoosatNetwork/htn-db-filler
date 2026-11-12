@@ -554,7 +554,7 @@ class BlocksProcessor(object):
                                                                     script_public_key_type=out["verboseData"].get("scriptPublicKeyType")))
 
                         for index, tx_in in enumerate(transaction.get("inputs", [])):
-                            if self.env_enable_balance != False and self.synced == True:
+                            if self.env_enable_balance != False:
                                 prev_out_tx_id = tx_in["previousOutpoint"]["transactionId"]
                                 prev_out_index = int(tx_in["previousOutpoint"].get("index", 0))
                                 # Resolved later, in a batch, by _resolve_prev_output_addresses -
