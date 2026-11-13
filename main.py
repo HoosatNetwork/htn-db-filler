@@ -212,7 +212,8 @@ async def main():
             _logger.error('BlocksProcessor.loop exited unexpectedly without exception. Restarting in 5s.')
             await asyncio.sleep(5)
             resume_hash = bp.last_committed_hash or resume_hash
-            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance, vcp_positioned=True)
+            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance, vcp_positioned=True,
+                                 recent_blocks=bp.recent_blocks)
             restart_attempts = 0
             continue
         except Exception:
@@ -223,8 +224,11 @@ async def main():
             # Resume from the newest fully committed block, not from the container's boot-time start point.
             resume_hash = bp.last_committed_hash or resume_hash
             _logger.info('Restarting block processing from %s', resume_hash)
-            # recreate the processor to ensure a clean state
-            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance, vcp_positioned=True)
+            # recreate the processor to ensure a clean state. It keeps the old one's memory of
+            # committed blocks, so the blocks the node serves again from the restart point
+            # are not queued and committed a second time.
+            bp = BlocksProcessor(client, vcp, bap, batch_processing, env_enable_balance, vcp_positioned=True,
+                                 recent_blocks=bp.recent_blocks)
             continue
 
 
