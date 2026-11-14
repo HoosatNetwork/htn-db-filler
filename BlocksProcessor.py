@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sys
 import os
+from collections import OrderedDict
 from datetime import datetime
 import time
 
@@ -32,12 +33,28 @@ NO_CHAIN_BLOCK_WAIT_SECONDS = int(os.getenv("NO_CHAIN_BLOCK_WAIT_SECONDS", "10")
 # After this many consecutive such rounds the warning becomes an error and the wait grows
 # to RESUME_SLOW_WAIT_SECONDS. The iterator keeps asking and never raises: main.py would
 # restart the whole walk from the start hash and drop the uncommitted queue.
+# The same two settings pace the retries after an error answer of getBlocks; there the
+# first RESUME_FAST_ATTEMPTS waits are 1 s, 2 s, ..., at most NO_CHAIN_BLOCK_WAIT_SECONDS.
 RESUME_FAST_ATTEMPTS = int(os.getenv("RESUME_FAST_ATTEMPTS", "6"))
 RESUME_SLOW_WAIT_SECONDS = int(os.getenv("RESUME_SLOW_WAIT_SECONDS", "60"))
 # Timeout of one getBlockRequest used to fetch a block the window did not serve.
 GET_BLOCK_TIMEOUT_SECONDS = int(os.getenv("GET_BLOCK_TIMEOUT_SECONDS", "30"))
 # How many selected parents a non-chain low hash is followed down to its chain ancestor.
+# At the tip this is also the deepest reorg below the low hash that the walk follows.
 CHAIN_ANCESTOR_MAX_STEPS = 1000
+# How many committed blocks the walk remembers, so that a block the node serves again is
+# not queued and committed again (see RecentBlocks). About an hour of blocks at 5 BPS; it
+# has to stay larger than the anticone the node appends to a window at the tip.
+RECENT_BLOCKS_SIZE = 20000
+# A window that follows one at the tip still counts as at the tip when it has at most this
+# many blocks, even without the virtual selected parent read just before it: the node
+# answers getBlocks from a 1 s cache per low hash (rpchandlers/get_blocks.go), so a window
+# another client asked for a moment earlier can be older than that block. It is far below
+# the MergeSetSizeLimit + 1 = 181 blocks from which the node cuts a window short. When the
+# anticone at the tip is larger than this, such an older window counts as not at the tip:
+# the walk then asks getBlock for a chain child, and warns and waits
+# NO_CHAIN_BLOCK_WAIT_SECONDS when there is none. No block is lost.
+TIP_WINDOW_MAX_BLOCKS = 50
 
 B_TREE_SIZE = 2500
 
@@ -60,6 +77,35 @@ task_runner = None
 
 class _ResumeFailed(Exception):
     """Neither route of BlocksProcessor._resume_from produced a resume point; the message says why."""
+
+
+class RecentBlocks(object):
+    """
+    Hashes of the blocks the walk committed most recently, oldest forgotten first.
+
+    The node serves the same block more than once: at the tip the anticone of the virtual
+    selected parent comes back with every window until a chain block merges it, and a
+    catch-up window is served again above the block the walk resumes from. Queueing such a
+    block again would only rewrite its transactions' rows with the block hashes they
+    already have, every second at the tip. A block is remembered only after its row was
+    committed, and not when a transaction of its cluster could not be stored (the one
+    exception is named in loop), so skipping one loses nothing; a block that was
+    forgotten is simply queued again.
+    """
+
+    def __init__(self, size=RECENT_BLOCKS_SIZE):
+        self.size = size
+        self._hashes = OrderedDict()
+
+    def __contains__(self, block_hash):
+        return block_hash in self._hashes
+
+    def add_all(self, block_hashes):
+        for block_hash in block_hashes:
+            self._hashes[block_hash] = None
+            self._hashes.move_to_end(block_hash)
+        while len(self._hashes) > self.size:
+            self._hashes.popitem(last=False)
 
 
 def _is_chain_block(block):
@@ -177,7 +223,8 @@ class BlocksProcessor(object):
     BlocksProcessor polls hoosat for blocks and adds the meta information and it's transactions into database.
     """
 
-    def __init__(self, client, vcp_instance, balance, batch_processing = False, env_enable_balance = False, vcp_positioned = False):
+    def __init__(self, client, vcp_instance, balance, batch_processing = False, env_enable_balance = False, vcp_positioned = False,
+                 recent_blocks = None):
         self.client = client
         self.blocks_to_add = []
         self.balance = balance
@@ -194,7 +241,8 @@ class BlocksProcessor(object):
         # True when the VCP already has a valid start point (loop restarted after a crash), so it must not be moved back.
         self.start_hash_set = vcp_positioned
 
-        # Hash of the newest block whose cluster was fully committed; the restart point after a crash.
+        # Low hash of the window that was being yielded when a commit last left nothing queued;
+        # the restart point after a crash.
         self.last_committed_hash = None
 
         # blockiter's low_hash as of the start of its current window request. Only ever advances
@@ -206,8 +254,18 @@ class BlocksProcessor(object):
         # mapping run instead of being lost for good (see _process_mapping_inserts_optimized).
         self.pending_mapping_retry_ids = []
 
-        # Did the loop already see the DAG tip
+        # Whether the getBlocks window being yielded reached the DAG tip (set per window by
+        # blockiter). It picks the cluster size, and in blockiter whether the walk waits before
+        # it asks again and whether a window with no chain block above the low hash keeps the
+        # low hash or asks for the chain child. The next low hash is never taken from it, so
+        # neither choice can skip a block.
         self.synced = False
+
+        # Blocks committed recently, which blockiter does not yield again. main.py hands the
+        # same instance to the processor it creates after a crash.
+        self.recent_blocks = recent_blocks if recent_blocks is not None else RecentBlocks()
+        # Set by batch_commit_txs when a transaction of the cluster could not be stored.
+        self.tx_commit_failed = False
 
         # NEW: Track last processed block time to prevent going backwards
         self.last_block_time = 0
@@ -227,6 +285,8 @@ class BlocksProcessor(object):
             cluster_size = CATCH_UP_CLUSTER_SIZE if not self.synced else CLUSTER_SIZE
             if len(self.blocks_to_add) >= cluster_size:
                 _logger.debug(f'Committing {cluster_size} blocks at {block_hash}')
+                cluster_hashes = [b.hash for b in self.blocks_to_add]
+                self.tx_commit_failed = False
                 # Transactions must be committed before blocks: handle_blocks_committed()
                 # schedules the VCP's acceptance walk right after this, and that walk only
                 # needs the blocks to be stored to mark a transaction "Accepted" -- if blocks
@@ -237,13 +297,24 @@ class BlocksProcessor(object):
                 else:
                     await self.batch_commit_txs()
                 await self.commit_blocks()
+                # These blocks are in the database with their transactions now, so blockiter
+                # need not yield them when the node serves them again. A block that
+                # commit_blocks kept queued is left out, and so is every block of a cluster
+                # with a transaction that could not be stored: such a block is queued again
+                # if the node serves it again. The node only does that for a block that is
+                # not in the past of the low hash, so it is not a retry of that transaction.
+                # One case is not covered: a block that commit_blocks kept queued in such a
+                # cluster is remembered once a later commit stores its row.
+                if not self.tx_commit_failed:
+                    still_queued = {b.hash for b in self.blocks_to_add}
+                    self.recent_blocks.add_all(h for h in cluster_hashes if h not in still_queued)
                 if not self.blocks_to_add:
-                    # Use the window's low_hash, not this block's own hash: at the tip, if the
-                    # node's getBlocks window didn't actually extend as far as this block (a rare
-                    # race against a concurrently-advancing tip), a child could be yielded before
-                    # its parent, and resuming from the child's hash would permanently skip that
-                    # parent. low_hash only ever advances once a window is confirmed served.
-                    self.last_committed_hash = self.current_low_hash or block_hash
+                    # Use the window's low_hash, not this block's own hash: a block of the
+                    # window is in general not a chain block whose whole past was yielded,
+                    # and resuming from it would permanently skip what is missing. The low
+                    # hash is such a block: blockiter only moves to it after its past was
+                    # yielded, and with nothing left queued all of that is stored.
+                    self.last_committed_hash = self.current_low_hash
                 asyncio.create_task(self.handle_blocks_committed())
                 # Update balances whenever a cluster is committed, not only at tip
                 if self.env_enable_balance != False:
@@ -375,12 +446,16 @@ class BlocksProcessor(object):
                                 f'or the chain moved)')
         return best[1]
 
-    async def _resume_from(self, low_hash, block_hashes, blocks):
+    async def _resume_from(self, low_hash, block_hashes, blocks, vsp_hash, at_tip):
         """
         Where to resume getBlocks after a window, as (next_hash, next_block, fetched): the
         chain block to use as the next low hash, its block, and the (hash, block) pairs the
         window did not serve but the next low hash's past needs, fetched by getBlock, in
-        blue work order. Raises _ResumeFailed when neither route works.
+        blue work order. Raises _ResumeFailed when neither route works. Returns None when
+        route 1 finds nothing and the window reached the tip (at_tip), or its anchor is
+        vsp_hash, the virtual selected parent the node had just before the request: there
+        is no chain block above the anchor yet, which is the normal state between two chain
+        blocks, so the caller keeps its low hash and asks again.
 
         Route 1: a chain block of the window whose chain down to the anchor is in the
         window; merge-set members that chain lacks are fetched (_resume_candidate).
@@ -403,6 +478,12 @@ class BlocksProcessor(object):
                                 f'{len(missing)} merge-set members in the window; fetching them by getBlock.')
             return next_hash, by_hash[next_hash], await self._fetch_blocks(missing)
 
+        # Route 2 is for a window the budget cut short far below the tip. A window that
+        # reached the tip was not cut short, so its anchor has no chain child yet: wait for
+        # one instead of asking getBlock for it and warning about its absence every round.
+        if at_tip or (vsp_hash is not None and anchor_hash == vsp_hash):
+            return None
+
         child_hash = await self._chain_child(anchor_hash)
         child = await self._fetch_block(child_hash, True)
         members = [member for member in _merge_set(child)
@@ -415,17 +496,40 @@ class BlocksProcessor(object):
         return child_hash, child, fetched
 
     async def blockiter(self, start_point):
+        """
+        Yields (hash, block) for every block the node serves through getBlocks from
+        start_point on: each window whole, and every next window from a chain block whose
+        past has been yielded (_resume_from). That is a block of the window or, when a
+        window that did not reach the tip has no such block, the chain child that getBlock
+        names, after its merge set was fetched and yielded. The same rule holds while
+        catching up and at the tip.
+
+        A window must be yielded whole and the next low hash must be a block whose past was
+        yielded, because the next window leaves out the whole past of its low hash
+        (syncmanager/antipast.go):
+        a block of that past that was not yielded is never served again. When its walk
+        reaches the virtual selected parent, HTND appends that block's anticone after the
+        part sorted by blue work, as a BFS from the DAG tips down through parents collects
+        it (rpchandlers/get_blocks.go, dagtraversalmanager/anticone.go), so a tip comes
+        before its own parents there: a DAG tip is never a safe low hash.
+        """
         low_hash = start_point
         resume_failures = 0
+        error_rounds = 0
         while True:
             self.current_low_hash = low_hash
             _logger.info('Requesting with low hash block %s.', low_hash)
+            # Asked before getBlocks, so the window is built against this virtual selected
+            # parent or a later one. It only tells whether the window reached the tip. The
+            # next low hash is never taken from this answer: a block named here may have a
+            # past that the window did not serve.
             daginfo = await self.client.request("getBlockDagInfoRequest", {})
             if daginfo is None:
                 await asyncio.sleep(2)
                 continue
 
-            tip_hash = daginfo["getBlockDagInfoResponse"]["tipHashes"][0]
+            virtual_parents = daginfo.get("getBlockDagInfoResponse", {}).get("virtualParentHashes")
+            vsp_hash = virtual_parents[0] if virtual_parents else None
             start_req = time.time()
             resp = await self.client.request("getBlocksRequest", {
                 "lowHash": low_hash,
@@ -444,69 +548,104 @@ class BlocksProcessor(object):
             block_hashes = block_response.get("blockHashes", [])
             blocks = block_response.get("blocks", [])
 
-            _logger.info(f'Received {len(block_hashes)} blocks. Tip: {tip_hash[:8]}...')
+            error = block_response.get("error")
+            if error is not None:
+                # The node refused the request, for example "Could not find lowHash" after
+                # its datadir was replaced. The walk keeps its low hash and asks again, at
+                # the tip too: a low hash taken from anywhere but a window skips every block
+                # in between. It can wait here for good, so the reason has to be in the log.
+                # The wait grows by a second a round, so that a single error costs little.
+                message = (error.get("message") or "no message") if isinstance(error, dict) else error
+                error_rounds += 1
+                if error_rounds <= RESUME_FAST_ATTEMPTS:
+                    wait, log = min(error_rounds, NO_CHAIN_BLOCK_WAIT_SECONDS), _logger.warning
+                else:
+                    wait, log = RESUME_SLOW_WAIT_SECONDS, _logger.error
+                log(f'getBlocks from {low_hash} failed: {message} (round {error_rounds}). '
+                    f'Waiting {wait}s and asking again.')
+                await asyncio.sleep(wait)
+                continue
+            error_rounds = 0
 
-            advanced = False
-            for i, blockHash in enumerate(block_hashes):
-                block_data = blocks[i]
-                block_time = int(block_data["header"]["timestamp"]) // 1000
+            if not block_hashes or len(blocks) != len(block_hashes):
+                _logger.info("No progress. Waiting...")
+                await asyncio.sleep(0.5)
+                continue
 
-                if blockHash == tip_hash:
-                    _logger.info('Found tip hash. Generator is synced now.')
-                    self.synced = True
-                    break
+            # The window reached the tip when it holds the virtual selected parent read just
+            # before it, or when it follows such a window and is small (TIP_WINDOW_MAX_BLOCKS).
+            synced = (vsp_hash is not None and vsp_hash in block_hashes) or (
+                self.synced and len(block_hashes) <= TIP_WINDOW_MAX_BLOCKS)
+            if synced and not self.synced:
+                _logger.info('Found tip hash. Generator is synced now.')
+            elif self.synced and not synced:
+                _logger.info('The getBlocks window no longer reaches the tip. Catching up.')
+            self.synced = synced
+
+            _logger.info(f'Received {len(block_hashes)} blocks, {"at" if synced else "not at"} the tip. '
+                         f'Virtual selected parent: {(vsp_hash or "?")[:8]}...')
+
+            # The whole window, the appended anticone included, in the order of the node's
+            # own sort (blue work, then hash), so that no block comes before one of its
+            # ancestors. The low hash, which the node prepends, stays first: its ancestors
+            # are not in the window, and on a first start it is the block the VCP starts
+            # from. Blocks committed already are not yielded again (RecentBlocks).
+            window = list(zip(block_hashes, blocks))
+            window = window[:1] + sorted(window[1:], key=_blue_work_key)
+            for blockHash, block_data in window:
+                if blockHash in self.recent_blocks:
+                    continue
 
                 # Yield the block
                 yield blockHash, block_data
 
                 # Update last seen time
+                block_time = int(block_data["header"]["timestamp"]) // 1000
                 if block_time >= self.last_block_time:
                     self.last_block_time = block_time
 
-                advanced = True
-
-            # Update low_hash safely
-            if self.synced:
-                low_hash = tip_hash
-                _logger.info(f'Synced to tip. Waiting {CLUSTER_WAIT_SECONDS}s...')
-                await asyncio.sleep(CLUSTER_WAIT_SECONDS)
-            else:
-                if advanced and block_hashes:
-                    # Advance to a chain block whose past has been served, never to the last
-                    # block: that is the heaviest block, chain or not, and a non-chain low
-                    # hash makes the node serve the same window again (_resume_candidate).
-                    # Blocks the window failed to serve are fetched by hash and yielded
-                    # here, through the same path as window blocks.
-                    try:
-                        next_hash, next_block, fetched = await self._resume_from(low_hash, block_hashes, blocks)
-                    except _ResumeFailed as failure:
-                        resume_failures += 1
-                        if resume_failures <= RESUME_FAST_ATTEMPTS:
-                            wait, log = NO_CHAIN_BLOCK_WAIT_SECONDS, _logger.warning
-                        else:
-                            wait, log = RESUME_SLOW_WAIT_SECONDS, _logger.error
-                        log(f'No block to resume from after the getBlocks window from {low_hash} '
-                            f'({len(block_hashes)} blocks): {failure} (round {resume_failures}). '
-                            f'Waiting {wait}s and asking again.')
-                        await asyncio.sleep(wait)
-                        continue
-                    resume_failures = 0
-                    for fetched_hash, fetched_block in fetched:
-                        yield fetched_hash, fetched_block
-                        fetched_time = int(fetched_block["header"]["timestamp"]) // 1000
-                        if fetched_time >= self.last_block_time:
-                            self.last_block_time = fetched_time
-                    if fetched:
-                        _logger.info(f'Yielded {len(fetched)} blocks fetched by getBlock after the window '
-                                     f'from {low_hash[:8]}...')
-                    low_hash = next_hash
-                    next_time = int(next_block["header"]["timestamp"]) // 1000
-                    self.last_block_time = max(self.last_block_time, next_time)
+            # Advance to a chain block whose past has been served, never to the last
+            # block: that is the heaviest block, chain or not, and a non-chain low
+            # hash makes the node serve the same window again (_resume_candidate).
+            # Never to a DAG tip either. Blocks the window failed to serve are fetched
+            # by hash and yielded here, through the same path as window blocks.
+            try:
+                resumed = await self._resume_from(low_hash, block_hashes, blocks, vsp_hash, synced)
+            except _ResumeFailed as failure:
+                resume_failures += 1
+                if resume_failures <= RESUME_FAST_ATTEMPTS:
+                    wait, log = NO_CHAIN_BLOCK_WAIT_SECONDS, _logger.warning
                 else:
-                    _logger.info("No progress. Waiting...")
-                    await asyncio.sleep(0.5)
+                    wait, log = RESUME_SLOW_WAIT_SECONDS, _logger.error
+                log(f'No block to resume from after the getBlocks window from {low_hash} '
+                    f'({len(block_hashes)} blocks): {failure} (round {resume_failures}). '
+                    f'Waiting {wait}s and asking again.')
+                await asyncio.sleep(wait)
+                continue
+            resume_failures = 0
 
-            _logger.info(f'New low hash: {low_hash[:8]}... (last block time: {self.last_block_time})')
+            if resumed is not None:
+                next_hash, next_block, fetched = resumed
+                fetched = [item for item in fetched if item[0] not in self.recent_blocks]
+                for fetched_hash, fetched_block in fetched:
+                    yield fetched_hash, fetched_block
+                    fetched_time = int(fetched_block["header"]["timestamp"]) // 1000
+                    if fetched_time >= self.last_block_time:
+                        self.last_block_time = fetched_time
+                if fetched:
+                    _logger.info(f'Yielded {len(fetched)} blocks fetched by getBlock after the window '
+                                 f'from {low_hash[:8]}...')
+                low_hash = next_hash
+                next_time = int(next_block["header"]["timestamp"]) // 1000
+                self.last_block_time = max(self.last_block_time, next_time)
+                _logger.info(f'New low hash: {low_hash[:8]}... (last block time: {self.last_block_time})')
+
+            if synced or resumed is None:
+                # Everything the node has was yielded, and when resumed is None the low hash
+                # stays: no chain block above it yet. Give the node time for new blocks.
+                _logger.info(f'{"Synced to tip" if synced else "No chain block above the low hash yet"}. '
+                             f'Waiting {CLUSTER_WAIT_SECONDS}s...')
+                await asyncio.sleep(CLUSTER_WAIT_SECONDS)
 
     async def __add_tx_to_queue(self, block_hash, block):
         """
@@ -698,6 +837,8 @@ class BlocksProcessor(object):
                         except Exception:
                             pass
                         _logger.warning(f"Error updating existing tx block_hashes chunk: {e}")
+                        # the merges of this chunk may be lost; see loop()
+                        self.tx_commit_failed = True
                         if attempt == 0:
                             await asyncio.sleep(0.25)
                             continue
@@ -794,6 +935,9 @@ class BlocksProcessor(object):
         for n, (g, inserted) in enumerate(zip(groups, results), start=1):
             _logger.info(f'Committed batch {n} ({len(inserted)}/{len(g)} new txs)')
             all_tx_ids_to_map.extend(inserted)
+            if len(inserted) < len(g):
+                # a transaction was not stored; see loop()
+                self.tx_commit_failed = True
 
         # Mapping (only for newly inserted txs)
         if all_tx_ids_to_map:
